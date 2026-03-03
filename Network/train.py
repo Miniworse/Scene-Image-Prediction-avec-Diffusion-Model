@@ -1,0 +1,535 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import os
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+import glob
+import random
+
+
+# 1. 定义U-Net网络结构（保持不变）
+class DoubleConv(nn.Module):
+    """(卷积 => [BN] => ReLU) * 2"""
+
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.double_conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        return self.double_conv(x)
+
+
+class Down(nn.Module):
+    """下采样"""
+
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.maxpool_conv = nn.Sequential(
+            nn.MaxPool2d(2),
+            DoubleConv(in_channels, out_channels)
+        )
+
+    def forward(self, x):
+        return self.maxpool_conv(x)
+
+
+class Up(nn.Module):
+    """上采样"""
+
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.up = nn.ConvTranspose2d(in_channels, in_channels // 2, kernel_size=2, stride=2)
+        self.conv = DoubleConv(in_channels, out_channels)
+
+    def forward(self, x1, x2):
+        x1 = self.up(x1)
+        diffY = x2.size()[2] - x1.size()[2]
+        diffX = x2.size()[3] - x1.size()[3]
+
+        x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2,
+                        diffY // 2, diffY - diffY // 2])
+        x = torch.cat([x2, x1], dim=1)
+        return self.conv(x)
+
+
+class OutConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+class UNet(nn.Module):
+    def __init__(self, n_channels=3, n_classes=3):
+        super().__init__()
+        self.n_channels = n_channels
+        self.n_classes = n_classes
+
+        self.inc = DoubleConv(n_channels, 64)
+        self.down1 = Down(64, 128)
+        self.down2 = Down(128, 256)
+        self.down3 = Down(256, 512)
+        self.down4 = Down(512, 1024)
+
+        self.up1 = Up(1024, 512)
+        self.up2 = Up(512, 256)
+        self.up3 = Up(256, 128)
+        self.up4 = Up(128, 64)
+        self.outc = OutConv(64, n_classes)
+
+    def forward(self, x):
+        x1 = self.inc(x)
+        x2 = self.down1(x1)
+        x3 = self.down2(x2)
+        x4 = self.down3(x3)
+        x5 = self.down4(x4)
+
+        x = self.up1(x5, x4)
+        x = self.up2(x, x3)
+        x = self.up3(x, x2)
+        x = self.up4(x, x1)
+        logits = self.outc(x)
+        return logits
+
+
+# 2. 自定义数据集类 - 适配您的.npy文件格式
+class SceneObserveDataset(Dataset):
+    def __init__(self, data_dir, indices, transform=None, normalize=True):
+        """
+        Args:
+            data_dir: 数据目录路径
+            indices: 要使用的数据索引列表
+            transform: 数据增强转换
+            normalize: 是否归一化数据
+        """
+        self.data_dir = data_dir
+        self.indices = indices
+        self.transform = transform
+        self.normalize = normalize
+
+        # 提取所有可用的scene文件
+        self.scene_files = sorted(glob.glob(os.path.join(data_dir, "scene_*.npy")))
+
+        # 验证每个scene文件是否有对应的observe文件
+        self.valid_pairs = []
+        for scene_file in self.scene_files:
+            # 提取序号
+            base_name = os.path.basename(scene_file)
+            index = base_name.replace("scene_", "").replace(".npy", "")
+            observe_file = os.path.join(data_dir, f"observe_{index}.npy")
+
+            if os.path.exists(observe_file):
+                self.valid_pairs.append((scene_file, observe_file))
+
+        print(f"Found {len(self.valid_pairs)} valid scene-observe pairs")
+
+        # 只使用指定的indices
+        if indices is not None:
+            self.valid_pairs = [self.valid_pairs[i] for i in indices if i < len(self.valid_pairs)]
+
+    def __len__(self):
+        return len(self.valid_pairs)
+
+    def __getitem__(self, idx):
+        scene_path, observe_path = self.valid_pairs[idx]
+
+        # 加载.npy文件
+        scene_data = np.load(scene_path)  # 干净图像
+        observe_data = np.load(observe_path)  # 加噪图像
+
+        # 检查数据形状并确保为3通道
+        if len(scene_data.shape) == 2:  # 如果是单通道灰度图
+            scene_data = np.stack([scene_data] * 3, axis=0)
+            observe_data = np.stack([observe_data] * 3, axis=0)
+        elif len(scene_data.shape) == 3:
+            # 确保通道在第一个维度 (C, H, W)
+            if scene_data.shape[0] != 3:
+                scene_data = scene_data.transpose(2, 0, 1)
+                observe_data = observe_data.transpose(2, 0, 1)
+
+        # 转换为浮点张量
+        scene_tensor = torch.from_numpy(scene_data).float()
+        observe_tensor = torch.from_numpy(observe_data).float()
+
+        # 数据归一化（可选）
+        if self.normalize:
+            scene_tensor = scene_tensor / 255.0 if scene_tensor.max() > 1.0 else scene_tensor
+            observe_tensor = observe_tensor / 255.0 if observe_tensor.max() > 1.0 else observe_tensor
+
+        # 数据增强（如果指定）
+        if self.transform:
+            # 这里可以添加随机裁剪、翻转等增强
+            scene_tensor = self.transform(scene_tensor)
+            observe_tensor = self.transform(observe_tensor)
+
+        return scene_tensor, observe_tensor
+
+
+# 3. 数据划分函数
+def split_dataset(data_dir, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
+    """
+    划分数据集为训练集、验证集和测试集
+    """
+    # 确保比例和为1
+    assert train_ratio + val_ratio + test_ratio == 1.0, "比例之和必须为1"
+
+    # 获取所有scene文件
+    scene_files = sorted(glob.glob(os.path.join(data_dir, "scene_*.npy")))
+
+    # 验证每个scene文件是否有对应的observe文件
+    valid_indices = []
+    for i, scene_file in enumerate(scene_files):
+        base_name = os.path.basename(scene_file)
+        index = base_name.replace("scene_", "").replace(".npy", "")
+        observe_file = os.path.join(data_dir, f"observe_{index}.npy")
+
+        if os.path.exists(observe_file):
+            valid_indices.append(i)
+
+    print(f"Total valid pairs: {len(valid_indices)}")
+
+    # 划分数据集
+    train_val_indices, test_indices = train_test_split(
+        valid_indices, test_size=test_ratio, random_state=seed
+    )
+
+    train_indices, val_indices = train_test_split(
+        train_val_indices, test_size=val_ratio / (train_ratio + val_ratio), random_state=seed
+    )
+
+    print(f"Train set: {len(train_indices)} samples")
+    print(f"Validation set: {len(val_indices)} samples")
+    print(f"Test set: {len(test_indices)} samples")
+
+    return train_indices, val_indices, test_indices
+
+
+# 4. 训练函数
+def train_model(model, train_loader, val_loader, epochs=50, lr=0.001, device='cuda'):
+    model = model.to(device)
+    criterion = nn.MSELoss()  # 使用均方误差损失
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5)
+
+    train_losses = []
+    val_losses = []
+
+    best_val_loss = float('inf')
+    best_model_state = None
+
+    for epoch in range(epochs):
+        # 训练阶段
+        model.train()
+        train_loss = 0.0
+        for batch_idx, (scene_imgs, observe_imgs) in enumerate(train_loader):
+            scene_imgs, observe_imgs = scene_imgs.to(device), observe_imgs.to(device)
+
+            optimizer.zero_grad()
+            outputs = model(scene_imgs)
+            loss = criterion(outputs, observe_imgs)
+            loss.backward()
+            optimizer.step()
+
+            train_loss += loss.item()
+
+            if batch_idx % 10 == 0:
+                print(f'Epoch: {epoch + 1}/{epochs} | Batch: {batch_idx}/{len(train_loader)} | Loss: {loss.item():.6f}')
+
+        avg_train_loss = train_loss / len(train_loader)
+        train_losses.append(avg_train_loss)
+
+        # 验证阶段
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for scene_imgs, observe_imgs in val_loader:
+                scene_imgs, observe_imgs = scene_imgs.to(device), observe_imgs.to(device)
+                outputs = model(scene_imgs)
+                loss = criterion(outputs, observe_imgs)
+                val_loss += loss.item()
+
+        avg_val_loss = val_loss / len(val_loader)
+        val_losses.append(avg_val_loss)
+
+        # 保存最佳模型
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            best_model_state = model.state_dict().copy()
+            torch.save(model.state_dict(), './model/scene_to_observe_model.pth')
+            print(f'New best model saved with validation loss: {best_val_loss:.6f}')
+
+        scheduler.step(avg_val_loss)
+
+        print(
+            f'Epoch: {epoch + 1}/{epochs} | Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f} | LR: {optimizer.param_groups[0]["lr"]:.6f}')
+        print('-' * 60)
+
+    # 加载最佳模型
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+
+    # 绘制训练曲线
+    plt.figure(figsize=(10, 5))
+    plt.plot(train_losses, label='Train Loss')
+    plt.plot(val_losses, label='Val Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.title('Training and Validation Loss')
+    plt.grid(True)
+    plt.savefig('training_curve.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+    return model
+
+
+# 5. 测试和可视化函数
+def test_and_visualize(model, test_loader, device='cuda', num_samples=4):
+    model.eval()
+    criterion = nn.MSELoss()
+    test_loss = 0.0
+
+    with torch.no_grad():
+        for scene_imgs, observe_imgs in test_loader:
+            scene_imgs, observe_imgs = scene_imgs.to(device), observe_imgs.to(device)
+            outputs = model(scene_imgs)
+            loss = criterion(outputs, observe_imgs)
+            test_loss += loss.item()
+
+    avg_test_loss = test_loss / len(test_loader)
+    print(f'Test Loss: {avg_test_loss:.6f}')
+
+    # 可视化一些结果
+    scene_imgs, observe_imgs = next(iter(test_loader))
+    scene_imgs, observe_imgs = scene_imgs.to(device), observe_imgs.to(device)
+    predicted = model(scene_imgs[:num_samples])  # 预测前几个样本
+
+    # 转换为numpy用于显示
+    scene_np = scene_imgs[:num_samples].cpu().numpy()
+    observe_np = observe_imgs[:num_samples].cpu().numpy()
+    predicted_np = predicted.detach().cpu().numpy()
+
+    # 如果通道在第一个维度，调整为最后一个维度用于显示
+    if scene_np.shape[1] == 3:  # (B, C, H, W)
+        scene_np = scene_np.transpose(0, 2, 3, 1)
+        observe_np = observe_np.transpose(0, 2, 3, 1)
+        predicted_np = predicted_np.transpose(0, 2, 3, 1)
+
+    # 显示结果
+    fig, axes = plt.subplots(num_samples, 3, figsize=(12, 4 * num_samples))
+    if num_samples == 1:
+        axes = axes.reshape(1, -1)
+
+    for i in range(num_samples):
+        # 确保值在[0,1]范围内
+        scene_img = np.clip(scene_np[i], 0, 1)
+        observe_img = np.clip(observe_np[i], 0, 1)
+        predicted_img = np.clip(predicted_np[i], 0, 1)
+
+        # 如果图像是单通道，转换为3通道显示
+        if len(scene_img.shape) == 2:
+            scene_img = np.stack([scene_img] * 3, axis=-1)
+            observe_img = np.stack([observe_img] * 3, axis=-1)
+            predicted_img = np.stack([predicted_img] * 3, axis=-1)
+
+        axes[i, 0].imshow(scene_img)
+        axes[i, 0].set_title('Scene (Clean Input)')
+        axes[i, 0].axis('off')
+
+        axes[i, 1].imshow(observe_img)
+        axes[i, 1].set_title('Observe (Ground Truth Noisy)')
+        axes[i, 1].axis('off')
+
+        axes[i, 2].imshow(predicted_img)
+        axes[i, 2].set_title('Predicted Noisy')
+        axes[i, 2].axis('off')
+
+    plt.tight_layout()
+    plt.savefig('test_results.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+    return avg_test_loss
+
+
+# 6. 主函数
+def main():
+    # 设置随机种子以确保可重复性
+    torch.manual_seed(42)
+    np.random.seed(42)
+    random.seed(42)
+
+    # 设置设备
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f'Using device: {device}')
+
+    # 数据目录路径
+    data_dir = '../data/data15Janv/TB'   # 修改为您的数据目录路径
+
+    # 检查数据目录是否存在
+    if not os.path.exists(data_dir):
+        print(f"数据目录 {data_dir} 不存在，请检查路径！")
+        return
+
+    # 划分数据集
+    train_indices, val_indices, test_indices = split_dataset(
+        data_dir,
+        train_ratio=0.7,
+        val_ratio=0.15,
+        test_ratio=0.15,
+        seed=42
+    )
+
+    # 创建数据集
+    train_dataset = SceneObserveDataset(data_dir, train_indices, normalize=True)
+    val_dataset = SceneObserveDataset(data_dir, val_indices, normalize=True)
+    test_dataset = SceneObserveDataset(data_dir, test_indices, normalize=True)
+
+    print(f"\nDataset sizes:")
+    print(f"Training set: {len(train_dataset)} samples")
+    print(f"Validation set: {len(val_dataset)} samples")
+    print(f"Test set: {len(test_dataset)} samples")
+
+    # 检查一个样本的形状
+    sample_scene, sample_observe = train_dataset[0]
+    print(f"\nSample shape - Scene: {sample_scene.shape}, Observe: {sample_observe.shape}")
+
+    # 创建数据加载器
+    batch_size = 8
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+
+    # 确定输入通道数
+    sample_scene, _ = next(iter(train_loader))
+    in_channels = sample_scene.shape[1]
+    print(f"\nInput channels: {in_channels}")
+
+    # 创建模型
+    model = UNet(n_channels=in_channels, n_classes=in_channels)
+
+    # 打印模型结构
+    print(f"\nModel architecture:")
+    print(model)
+    print(f'Total parameters: {sum(p.numel() for p in model.parameters()):,}')
+
+    # 训练模型
+    epochs = 50
+    learning_rate = 0.001
+
+    print(f"\nStarting training...")
+    print(f"Epochs: {epochs}")
+    print(f"Batch size: {batch_size}")
+    print(f"Learning rate: {learning_rate}")
+
+    model = train_model(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        epochs=epochs,
+        lr=learning_rate,
+        device=device
+    )
+
+    # 测试模型
+    print(f"\nTesting model...")
+    test_loss = test_and_visualize(model, test_loader, device, num_samples=4)
+
+    # 保存模型
+    torch.save(model.state_dict(), 'scene_to_observe_model.pth')
+    print('Model weights saved to scene_to_observe_model.pth')
+
+    # 保存完整模型（包括架构）
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'in_channels': in_channels,
+        'model_architecture': 'UNet'
+    }, 'scene_to_observe_model_full.pth')
+    print('Full model saved to scene_to_observe_model_full.pth')
+
+    # 保存训练历史（如果需要）
+    history = {
+        'train_indices': train_indices,
+        'val_indices': val_indices,
+        'test_indices': test_indices,
+        'input_channels': in_channels,
+        'test_loss': test_loss
+    }
+    np.save('training_history.npy', history)
+    print('Training history saved to training_history.npy')
+
+
+# 7. 数据检查函数
+def check_data_statistics(data_dir):
+    """检查数据集的统计信息"""
+    print(f"Checking data statistics in {data_dir}...")
+
+    # 获取所有scene文件
+    scene_files = sorted(glob.glob(os.path.join(data_dir, "scene_*.npy")))
+
+    if not scene_files:
+        print("No scene files found!")
+        return
+
+    print(f"Found {len(scene_files)} scene files")
+
+    # 检查前几个文件
+    for i, scene_file in enumerate(scene_files[:3]):
+        base_name = os.path.basename(scene_file)
+        index = base_name.replace("scene_", "").replace(".npy", "")
+        observe_file = os.path.join(data_dir, f"observe_{index}.npy")
+
+        if os.path.exists(observe_file):
+            scene_data = np.load(scene_file)
+            observe_data = np.load(observe_file)
+
+            print(f"\nFile {i + 1}: {base_name}")
+            print(f"  Scene shape: {scene_data.shape}, dtype: {scene_data.dtype}")
+            print(f"  Scene range: [{scene_data.min():.3f}, {scene_data.max():.3f}]")
+            print(f"  Observe shape: {observe_data.shape}, dtype: {observe_data.dtype}")
+            print(f"  Observe range: [{observe_data.min():.3f}, {observe_data.max():.3f}]")
+
+            # 可视化第一个样本
+            if i == 0:
+                fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+
+                if len(scene_data.shape) == 2:
+                    axes[0].imshow(scene_data, cmap='gray')
+                    axes[1].imshow(observe_data, cmap='gray')
+                elif len(scene_data.shape) == 3 and scene_data.shape[2] == 3:
+                    axes[0].imshow(scene_data)
+                    axes[1].imshow(observe_data)
+                elif len(scene_data.shape) == 3 and scene_data.shape[0] == 3:
+                    axes[0].imshow(scene_data.transpose(1, 2, 0))
+                    axes[1].imshow(observe_data.transpose(1, 2, 0))
+
+                axes[0].set_title('Scene (Clean)')
+                axes[1].set_title('Observe (Noisy)')
+                plt.tight_layout()
+                plt.show()
+        else:
+            print(f"  Warning: No corresponding observe file for {base_name}")
+
+
+# 运行主程序
+if __name__ == "__main__":
+    # 首先检查数据
+    data_dir = '../data/data15Janv/TB'  # 修改为您的数据目录
+
+    if os.path.exists(data_dir):
+        check_data_statistics(data_dir)
+
+    # 运行主训练程序
+    main()

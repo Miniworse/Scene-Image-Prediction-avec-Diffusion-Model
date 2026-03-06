@@ -11,6 +11,9 @@ import torch.nn.functional as F
 from torchvision import transforms
 from tqdm import tqdm
 import warnings
+import math
+
+import scripts.diffusion as diffusion
 
 warnings.filterwarnings('ignore')
 
@@ -21,38 +24,64 @@ def load_model(model_path, in_channels=3):
 
     # 重新定义UNet类（与训练时相同）
     class UNet(nn.Module):
-        def __init__(self, n_channels=3, n_classes=3):
+        def __init__(self, n_channels=3, n_classes=3, time_emb_dim=32):
             super().__init__()
             self.n_channels = n_channels
             self.n_classes = n_classes
+            self.time_emb_dim = time_emb_dim
+
+            # Timestep embedding
+            self.time_embed = nn.Sequential(
+                TimestepEmbedder(time_emb_dim),
+                nn.Linear(time_emb_dim, time_emb_dim),
+                nn.SiLU(),
+                nn.Linear(time_emb_dim, time_emb_dim)
+            )
 
             self.inc = DoubleConv(n_channels, 64)
-            self.down1 = Down(64, 128)
-            self.down2 = Down(128, 256)
-            self.down3 = Down(256, 512)
-            self.down4 = Down(512, 1024)
+            self.down1 = Down(64, 128, time_emb_dim)
+            self.down2 = Down(128, 256, time_emb_dim)
+            self.down3 = Down(256, 512, time_emb_dim)
+            self.down4 = Down(512, 1024, time_emb_dim)
 
-            self.up1 = Up(1024, 512)
-            self.up2 = Up(512, 256)
-            self.up3 = Up(256, 128)
-            self.up4 = Up(128, 64)
+            self.up1 = Up(1024, 512, time_emb_dim)
+            self.up2 = Up(512, 256, time_emb_dim)
+            self.up3 = Up(256, 128, time_emb_dim)
+            self.up4 = Up(128, 64, time_emb_dim)
             self.outc = OutConv(64, n_classes)
 
-        def forward(self, x):
-            x1 = self.inc(x)
-            x2 = self.down1(x1)
-            x3 = self.down2(x2)
-            x4 = self.down3(x3)
-            x5 = self.down4(x4)
+        def forward(self, x, timestep):
+            # Embed timestep
+            t = self.time_embed(timestep)
 
-            x = self.up1(x5, x4)
-            x = self.up2(x, x3)
-            x = self.up3(x, x2)
-            x = self.up4(x, x1)
+            x1 = self.inc(x)
+            x2 = self.down1(x1, t)
+            x3 = self.down2(x2, t)
+            x4 = self.down3(x3, t)
+            x5 = self.down4(x4, t)
+
+            x = self.up1(x5, x4, t)
+            x = self.up2(x, x3, t)
+            x = self.up3(x, x2, t)
+            x = self.up4(x, x1, t)
             logits = self.outc(x)
             return logits
 
     # 组件类
+    class TimestepEmbedder(nn.Module):
+        def __init__(self, embedding_dim):
+            super().__init__()
+            self.embedding_dim = embedding_dim
+            self.half_dim = embedding_dim // 2
+            emb = math.log(10000) / (self.half_dim - 1)
+            emb = torch.exp(torch.arange(self.half_dim, dtype=torch.float) * -emb)
+            self.register_buffer('emb', emb)
+
+        def forward(self, timestep):
+            emb = timestep.float()[:, None] * self.emb[None, :]
+            emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
+            return emb
+
     class DoubleConv(nn.Module):
         def __init__(self, in_channels, out_channels):
             super().__init__()
@@ -69,23 +98,36 @@ def load_model(model_path, in_channels=3):
             return self.double_conv(x)
 
     class Down(nn.Module):
-        def __init__(self, in_channels, out_channels):
+        def __init__(self, in_channels, out_channels, time_emb_dim):
             super().__init__()
             self.maxpool_conv = nn.Sequential(
                 nn.MaxPool2d(2),
                 DoubleConv(in_channels, out_channels)
             )
+            self.time_mlp = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(time_emb_dim, out_channels)
+            )
 
-        def forward(self, x):
-            return self.maxpool_conv(x)
+        def forward(self, x, t):
+            x = self.maxpool_conv(x)
+            # Add timestep embedding
+            b, c, h, w = x.shape
+            t = self.time_mlp(t)[:, :, None, None].repeat(1, 1, h, w)
+            x = x + t
+            return x
 
     class Up(nn.Module):
-        def __init__(self, in_channels, out_channels):
+        def __init__(self, in_channels, out_channels, time_emb_dim):
             super().__init__()
             self.up = nn.ConvTranspose2d(in_channels, in_channels // 2, kernel_size=2, stride=2)
             self.conv = DoubleConv(in_channels, out_channels)
+            self.time_mlp = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(time_emb_dim, in_channels)
+            )
 
-        def forward(self, x1, x2):
+        def forward(self, x1, x2, t):
             x1 = self.up(x1)
             diffY = x2.size()[2] - x1.size()[2]
             diffX = x2.size()[3] - x1.size()[3]
@@ -93,6 +135,10 @@ def load_model(model_path, in_channels=3):
             x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2,
                             diffY // 2, diffY - diffY // 2])
             x = torch.cat([x2, x1], dim=1)
+            # Add timestep embedding
+            b, c, h, w = x.shape
+            t = self.time_mlp(t)[:, :, None, None].repeat(1, 1, h, w)
+            x = x + t
             return self.conv(x)
 
     class OutConv(nn.Module):
@@ -104,7 +150,7 @@ def load_model(model_path, in_channels=3):
             return self.conv(x)
 
     # 创建模型并加载权重
-    model = UNet(n_channels=in_channels, n_classes=in_channels)
+    model = UNet(n_channels=in_channels, n_classes=in_channels, time_emb_dim=64)
 
     if os.path.exists(model_path):
         if model_path.endswith('.pth'):
@@ -192,13 +238,17 @@ def predict_and_save(model, dataset, output_dir, device='cuda'):
     inputs = []
     indices = []
 
+    betas = diffusion.linear_beta_schedule(1000)
+    noise_scheduler = diffusion.NoiseScheduler(betas)
+
     with torch.no_grad():
         for scene, observe, index in tqdm(dataset, desc="Predicting"):
             scene = scene.unsqueeze(0).to(device)  # 添加batch维度
             observe = observe.unsqueeze(0)
 
             # 预测
-            predicted = model(scene)
+            x_t =  torch.randn_like(scene).to(device)
+            pre_noise, predicted  = noise_scheduler.sampling(model, x_t)
 
             # 保存到列表
             predictions.append(predicted.cpu().numpy())
@@ -366,7 +416,7 @@ def evaluate_model(model_path, data_dir, output_dir, device='cuda'):
 
     # 1. 加载模型
     print("\n1. Loading model...")
-    model = load_model(model_path, in_channels=3)
+    model = load_model(model_path, in_channels=3, )
     if model is None:
         return
 
@@ -577,9 +627,9 @@ def main():
     print(f"Using device: {device}")
 
     # 配置路径
-    model_path = 'scene_to_observe_model.pth'  # 修改为您的模型路径
+    model_path = 'model/Predicted_noise_05Mars.pth'  # 修改为您的模型路径
     data_dir = '../data/data15Janv/TB' # 修改为您的数据目录
-    output_dir = './evaluation_results'  # 输出目录
+    output_dir = './evaluation_results1'  # 输出目录
 
     # 创建输出目录
     os.makedirs(output_dir, exist_ok=True)

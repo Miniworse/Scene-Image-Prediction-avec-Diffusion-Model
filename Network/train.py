@@ -10,8 +10,11 @@ from sklearn.model_selection import train_test_split
 import glob
 import random
 import math
+from datetime import datetime
+
 from argparse import ArgumentParser
 from scripts.params import params_all
+from scripts.utils import *
 
 import scripts.diffusion as diffusion
 
@@ -196,10 +199,14 @@ class SceneObserveDataset(Dataset):
         scene_data = np.load(scene_path)  # 干净图像
         observe_data = np.load(observe_path)  # 加噪图像
 
-        # 检查数据形状并确保为3通道
+        # 检查数据形状并确保为3通道, 不必要
         if len(scene_data.shape) == 2:  # 如果是单通道灰度图
-            scene_data = np.stack([scene_data] * 3, axis=0)
-            observe_data = np.stack([observe_data] * 3, axis=0)
+            scene_data = np.expand_dims(scene_data, axis=0)
+            observe_data = np.expand_dims(observe_data, axis=0)
+
+
+            # scene_data = np.stack([scene_data] * 3, axis=0)
+            # observe_data = np.stack([observe_data] * 3, axis=0)
         elif len(scene_data.shape) == 3:
             # 确保通道在第一个维度 (C, H, W)
             if scene_data.shape[0] != 3:
@@ -212,8 +219,12 @@ class SceneObserveDataset(Dataset):
 
         # 数据归一化（可选）
         if self.normalize:
-            scene_tensor = scene_tensor / 255.0 if scene_tensor.max() > 1.0 else scene_tensor
-            observe_tensor = observe_tensor / 255.0 if observe_tensor.max() > 1.0 else observe_tensor
+            # scene_tensor = scene_tensor / 255.0 if scene_tensor.max() > 1.0 else scene_tensor
+            # observe_tensor = observe_tensor / 255.0 if observe_tensor.max() > 1.0 else observe_tensor
+            # 在辐射计场景下的归一化操作？
+            scene_tensor = t_normalize(scene_tensor)
+            observe_tensor = t_normalize(observe_tensor)
+
 
         # 数据增强（如果指定）
         if self.transform:
@@ -264,7 +275,7 @@ def split_dataset(data_dir, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, se
 
 
 # 4. 训练函数
-def train_model(model, train_loader, val_loader, epochs=50, lr=0.001, device='cuda'):
+def train_model(model, train_loader, val_loader, model_name, epochs=50, lr=0.001, device='cpu'):
     model = model.to(device)
     criterion = nn.MSELoss()  # 使用均方误差损失
     optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -278,7 +289,7 @@ def train_model(model, train_loader, val_loader, epochs=50, lr=0.001, device='cu
 
     T = 1000  # Total timesteps
     betas = diffusion.linear_beta_schedule(T)
-    noise_scheduler = diffusion.NoiseScheduler(betas)
+    noise_scheduler = diffusion.NoiseScheduler(betas, device=device)
 
     for epoch in range(epochs):
         # 训练阶段
@@ -289,7 +300,7 @@ def train_model(model, train_loader, val_loader, epochs=50, lr=0.001, device='cu
 
             # Here add noise to the
             batch_size = len(scene_imgs)
-            t = torch.randint(0, T, (batch_size,))
+            t = torch.randint(0, T, (batch_size,)).to(device)
 
             xt, noise = noise_scheduler.forward_diffusion(scene_imgs, t)
 
@@ -501,13 +512,16 @@ def main(args):
     print(f"Batch size: {batch_size}")
     print(f"Learning rate: {learning_rate}")
 
+    model_name = datetime.now().strftime("%b%d-%H%M%S.pth")
+    model_dir = os.path.join('./model', model_name)
     model = train_model(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
         epochs=epochs,
         lr=learning_rate,
-        device=device
+        device=str(device),
+        model_name=model_dir
     )
 
     # 测试模型
@@ -515,8 +529,8 @@ def main(args):
     test_loss = test_and_visualize(model, test_loader, device, num_samples=num_workers)
 
     # 保存模型
-    torch.save(model.state_dict(), 'scene_to_observe_model.pth')
-    print('Model weights saved to scene_to_observe_model.pth')
+    torch.save(model.state_dict(), model_dir)
+    print('Model weights saved to {}'.format(model_name))
 
     # 保存完整模型（包括架构）
     torch.save({

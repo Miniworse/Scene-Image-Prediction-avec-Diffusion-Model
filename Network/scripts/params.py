@@ -19,10 +19,11 @@ class AttrDict(dict):
 
 params_all = AttrDict(
     task_id=1,
-    log_dir='./log/fmcw',
-    model_dir='./model/fmcw/b32-256-100s',
+    # log_dir='./log/fmcw',
+    model_dir='./model/Predicted_noise_05Mars.pth',
     data_dir='../data/data15Janv/TB',
-    out_dir='./dataset/fmcw/output',
+    output_dir='./output',
+
     cond_dir=['./dataset/fmcw/cond'],
     fid_pred_dir = './dataset/fmcw/img_matric/pred',
     fid_data_dir = './dataset/fmcw/img_matric/data',

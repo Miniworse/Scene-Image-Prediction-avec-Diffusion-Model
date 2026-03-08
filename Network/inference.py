@@ -14,6 +14,8 @@ import warnings
 import math
 
 import scripts.diffusion as diffusion
+from scripts.params import params_all
+from scripts.utils import *
 
 warnings.filterwarnings('ignore')
 
@@ -205,8 +207,12 @@ class PredictDataset:
 
         # 处理数据形状
         if len(scene_data.shape) == 2:  # 单通道
-            scene_data = np.stack([scene_data] * 3, axis=0)
-            observe_data = np.stack([observe_data] * 3, axis=0)
+
+            # scene_data = np.stack([scene_data] * 3, axis=0)
+            # observe_data = np.stack([observe_data] * 3, axis=0)
+            scene_data = np.expand_dims(scene_data, axis=0)
+            observe_data = np.expand_dims(observe_data, axis=0)
+
         elif len(scene_data.shape) == 3:
             if scene_data.shape[0] != 3:  # 如果通道在最后一个维度
                 scene_data = scene_data.transpose(2, 0, 1)
@@ -218,8 +224,10 @@ class PredictDataset:
 
         # 归一化
         if self.normalize:
-            scene_tensor = scene_tensor / 255.0 if scene_tensor.max() > 1.0 else scene_tensor
-            observe_tensor = observe_tensor / 255.0 if observe_tensor.max() > 1.0 else observe_tensor
+            # scene_tensor = scene_tensor / 255.0 if scene_tensor.max() > 1.0 else scene_tensor
+            # observe_tensor = observe_tensor / 255.0 if observe_tensor.max() > 1.0 else observe_tensor
+            scene_tensor = t_normalize(scene_tensor)
+            observe_tensor = t_normalize(observe_tensor)
 
         return scene_tensor, observe_tensor, index
 
@@ -239,7 +247,7 @@ def predict_and_save(model, dataset, output_dir, device='cuda'):
     indices = []
 
     betas = diffusion.linear_beta_schedule(1000)
-    noise_scheduler = diffusion.NoiseScheduler(betas)
+    noise_scheduler = diffusion.NoiseScheduler(betas, device)
 
     with torch.no_grad():
         for scene, observe, index in tqdm(dataset, desc="Predicting"):
@@ -248,7 +256,8 @@ def predict_and_save(model, dataset, output_dir, device='cuda'):
 
             # 预测
             x_t =  torch.randn_like(scene).to(device)
-            pre_noise, predicted  = noise_scheduler.sampling(model, x_t)
+            # pre_noise, predicted  = noise_scheduler.sampling(model, x_t)
+            pre_noise, predicted = noise_scheduler.native_sampling2(model, scene)
 
             # 保存到列表
             predictions.append(predicted.cpu().numpy())
@@ -622,14 +631,21 @@ def evaluate_multiple_models(model_paths, data_dir, output_base_dir, device='cud
 
 # 10. 主函数
 def main():
+    params = params_all
+
     # 设置设备
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
     # 配置路径
-    model_path = 'model/Predicted_noise_05Mars.pth'  # 修改为您的模型路径
-    data_dir = '../data/data15Janv/TB' # 修改为您的数据目录
-    output_dir = './evaluation_results1'  # 输出目录
+    model_path = params.model_dir
+    data_dir = params.data_dir
+    output_dir = params.output_dir
+
+    model_name = os.path.splitext(os.path.basename(model_path))[0]
+    data_name = os.path.basename(data_dir)  # 'TB'
+    output_name = f"{model_name}_{data_name}"
+    output_dir = os.path.join(output_dir, output_name)
 
     # 创建输出目录
     os.makedirs(output_dir, exist_ok=True)

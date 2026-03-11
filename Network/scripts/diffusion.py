@@ -43,7 +43,7 @@ class NoiseScheduler:
 
     def sampling(self, model, x_t):
         for i in range(999, 0, -1):
-            t = torch.tensor([i])
+            t = torch.tensor([i]).to(self.device)
             pre_noise = model(x_t, t)
             x_0 = self.deblur(x_t, t, pre_noise)
             if i>0:
@@ -53,7 +53,7 @@ class NoiseScheduler:
         return pre_noise, predicted
 
     def native_sampling(self, model, x_0):
-        t = torch.tensor([999])
+        t = torch.tensor([999]).to(self.device)
         x_t = self.add_noise(x_0, t, noise=torch.randn_like(x_0))
         pre_noise = model(x_t, t)
         predicted = self.deblur(x_t, t, pre_noise)
@@ -64,7 +64,7 @@ class NoiseScheduler:
         x_t = self.add_noise(x_0, torch.tensor([999]), noise=torch.randn_like(x_0))
 
         for i in range(999, 0, -1):
-            t = torch.tensor([i])
+            t = torch.tensor([i]).to(self.device)
             pre_noise = model(x_t, t)
             x_0 = self.deblur(x_t, t, pre_noise)
             if i>0:

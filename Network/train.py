@@ -275,7 +275,7 @@ def split_dataset(data_dir, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, se
 
 
 # 4. 训练函数
-def train_model(model, train_loader, val_loader, model_name, epochs=50, lr=0.001, device='cpu'):
+def train_model(model, train_loader, val_loader, model_dir, log_dir, epochs=50, lr=0.001, device='cpu'):
     model = model.to(device)
     criterion = nn.MSELoss()  # 使用均方误差损失
     optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -309,7 +309,6 @@ def train_model(model, train_loader, val_loader, model_name, epochs=50, lr=0.001
             loss = criterion(outputs, noise)
             loss.backward()
             optimizer.step()
-
             train_loss += loss.item()
 
             if batch_idx % 10 == 0:
@@ -341,8 +340,18 @@ def train_model(model, train_loader, val_loader, model_name, epochs=50, lr=0.001
         if epoch % 5 == 0:
             best_val_loss = avg_train_loss
             best_model_state = model.state_dict().copy()
-            torch.save(model.state_dict(), './model/scene_to_observe_model.pth')
+            torch.save(model.state_dict(), model_dir)
             print(f'New best model saved with validation loss: {best_val_loss:.6f}')
+
+            scene_save = scene_imgs[0].cpu().detach().numpy()
+            x_t_save = xt[0].cpu().detach().numpy()
+            outputs_save = outputs[0].cpu().detach().numpy()
+            noise_save = noise[0].cpu().detach().numpy()
+            t_value = t[0].item()
+
+            os.makedirs(log_dir, exist_ok=True)
+            np.savez(os.path.join(log_dir, f"train_{epoch}.npz"), **{f"x_{t_value}": x_t_save}, outputs = outputs_save, noise = noise_save, scene = scene_save)
+
 
         scheduler.step(avg_train_loss)
 
@@ -363,7 +372,7 @@ def train_model(model, train_loader, val_loader, model_name, epochs=50, lr=0.001
     plt.legend()
     plt.title('Training and Validation Loss')
     plt.grid(True)
-    plt.savefig('training_curve.png', dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(log_dir, 'training_curve.png'), dpi=300, bbox_inches='tight')
     plt.show()
 
     return model
@@ -374,12 +383,14 @@ def test_and_visualize(model, test_loader, device='cuda', num_samples=4):
     model.eval()
     criterion = nn.MSELoss()
     test_loss = 0.0
+    betas = diffusion.linear_beta_schedule(1000)
+    noise_scheduler = diffusion.NoiseScheduler(betas, device)
 
     with torch.no_grad():
         for scene_imgs, observe_imgs in test_loader:
             scene_imgs, observe_imgs = scene_imgs.to(device), observe_imgs.to(device)
-            outputs = model(scene_imgs)
-            loss = criterion(outputs, observe_imgs)
+            pre_noise, predicted = noise_scheduler.native_sampling2(model, scene_imgs)
+            loss = criterion(predicted, scene_imgs)
             test_loss += loss.item()
 
     avg_test_loss = test_loss / len(test_loader)
@@ -506,50 +517,55 @@ def main(args):
     # 训练模型
     epochs = params.epochs
     learning_rate = params.learning_rate
+    log_dir = params.log_dir
 
     print(f"\nStarting training...")
     print(f"Epochs: {epochs}")
     print(f"Batch size: {batch_size}")
     print(f"Learning rate: {learning_rate}")
 
-    model_name = datetime.now().strftime("%b%d-%H%M%S.pth")
-    model_dir = os.path.join('./model', model_name)
+    model_name = datetime.now().strftime("%b%d-%H%M%S")
+    model_dir = os.path.join('./model', model_name + '.pth')
+
+    log_dir = os.path.join(log_dir, model_name)
+
     model = train_model(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
+        model_dir=model_dir,
+        log_dir=log_dir,
         epochs=epochs,
         lr=learning_rate,
-        device=str(device),
-        model_name=model_dir
+        device=str(device)
     )
 
     # 测试模型
-    print(f"\nTesting model...")
-    test_loss = test_and_visualize(model, test_loader, device, num_samples=num_workers)
+    # print(f"\nTesting model...")
+    # test_loss = test_and_visualize(model, test_loader, device, num_samples=num_workers)
 
     # 保存模型
     torch.save(model.state_dict(), model_dir)
     print('Model weights saved to {}'.format(model_name))
 
-    # 保存完整模型（包括架构）
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'in_channels': in_channels,
-        'model_architecture': 'UNet'
-    }, 'scene_to_observe_model_full.pth')
-    print('Full model saved to scene_to_observe_model_full.pth')
+    # # 保存完整模型（包括架构）
+    # torch.save({
+    #     'model_state_dict': model.state_dict(),
+    #     'in_channels': in_channels,
+    #     'model_architecture': 'UNet'
+    # }, 'scene_to_observe_model_full.pth')
+    # print('Full model saved to scene_to_observe_model_full.pth')
 
-    # 保存训练历史（如果需要）
-    history = {
-        'train_indices': train_indices,
-        'val_indices': val_indices,
-        'test_indices': test_indices,
-        'input_channels': in_channels,
-        'test_loss': test_loss
-    }
-    np.save('training_history.npy', history)
-    print('Training history saved to training_history.npy')
+    # # 保存训练历史（如果需要）
+    # history = {
+    #     'train_indices': train_indices,
+    #     'val_indices': val_indices,
+    #     'test_indices': test_indices,
+    #     'input_channels': in_channels,
+    #     # 'test_loss': test_loss
+    # }
+    # np.save('training_history.npy', history)
+    # print('Training history saved to training_history.npy')
 
 
 # 7. 数据检查函数

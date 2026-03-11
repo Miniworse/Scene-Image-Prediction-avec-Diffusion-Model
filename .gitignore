@@ -3,7 +3,9 @@
 *.jpg
 *.asv
 *.npy
+*npz
 *.pth
 *.png
 *.pyc
 data/
+Network/data/

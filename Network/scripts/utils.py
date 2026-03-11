@@ -1,5 +1,6 @@
 import torch
-
+import numpy as np
+import matplotlib.pyplot as plt
 
 def t_normalize(TB, methods=1):
     """
@@ -69,3 +70,14 @@ def t_normalize(TB, methods=1):
     TB_normalized = TB_corrected / (std_matrix + eps)
 
     return TB_normalized
+
+def visualize(data_dir):
+    data = np.load(data_dir)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    x0_show = data.squeeze()
+    # x0_show = np.transpose(x0_show,(1, 2, 0))
+    # 在第一张子图上显示
+    ax1.imshow(x0_show)
+    ax1.set_title('Image 1')
+    plt.colorbar()
+    plt.show()

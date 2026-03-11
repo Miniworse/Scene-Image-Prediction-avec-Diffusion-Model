@@ -668,7 +668,7 @@ def run_prediction_only(model_path, data_dir, output_dir, device='cuda'):
     print("Running prediction only...")
 
     # 加载模型
-    model = load_model(model_path, in_channels=3)
+    model = load_model(model_path, in_channels=1)
     if model is None:
         return
 

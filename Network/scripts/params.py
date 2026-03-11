@@ -19,7 +19,7 @@ class AttrDict(dict):
 
 params_all = AttrDict(
     task_id=1,
-    # log_dir='./log/fmcw',
+    log_dir='./trainlog',
     model_dir='./model/Predicted_noise_05Mars.pth',
     data_dir='../data/data15Janv/TB',
     output_dir='./output',

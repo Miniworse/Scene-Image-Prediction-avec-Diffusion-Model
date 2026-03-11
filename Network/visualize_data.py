@@ -79,6 +79,8 @@ def visualize_and_save_npy_files(folder_path, save_dir="./visualizations", cmap=
                     # 如果数据是 [1, 256, 256]，去掉第一个维度
                     if var_data.ndim == 3 and var_data.shape[0] == 1:
                         var_data_2d = var_data[0]
+                    elif var_data.ndim == 4 and var_data.shape[0] == 1:
+                        var_data_2d = var_data[0][0]
                     else:
                         var_data_2d = var_data
 
@@ -111,6 +113,6 @@ def visualize_and_save_npy_files(folder_path, save_dir="./visualizations", cmap=
 
 
 # 使用示例
-folder_path = "D:\Documents\Self_Files\Projects\SceneGenerating\\Network\\trainlog\Mar10-131752"  # 输入文件夹路径
+folder_path = "D:\Documents\Self_Files\Projects\SceneGenerating\\Network\\trainlog\Mar11-050145"  # 输入文件夹路径
 save_dir = f"./output_images/{Path(folder_path).name}"  # 自动生成同名子目录
 visualize_and_save_npy_files(folder_path, save_dir=save_dir)

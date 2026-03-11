@@ -60,12 +60,13 @@ class NoiseScheduler:
 
         return pre_noise, predicted
 
-    def native_sampling2(self, model, x_0):
+    def native_sampling2(self, model, x_0, y):
         x_t = self.add_noise(x_0, torch.tensor([999]), noise=torch.randn_like(x_0))
 
         for i in range(999, 0, -1):
             t = torch.tensor([i]).to(self.device)
-            pre_noise = model(x_t, t)
+            x_t_y = torch.cat((x_t, y), dim=1)
+            pre_noise = model(x_t_y, t)
             x_0 = self.deblur(x_t, t, pre_noise)
             if i>0:
                 x_t = self.add_noise(x_0, t = torch.tensor([i-1]), noise=pre_noise)

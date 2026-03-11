@@ -252,12 +252,12 @@ def predict_and_save(model, dataset, output_dir, device='cuda'):
     with torch.no_grad():
         for scene, observe, index in tqdm(dataset, desc="Predicting"):
             scene = scene.unsqueeze(0).to(device)  # 添加batch维度
-            observe = observe.unsqueeze(0)
+            observe = observe.unsqueeze(0).to(device)
 
             # 预测
             x_t =  torch.randn_like(scene).to(device)
             # pre_noise, predicted  = noise_scheduler.sampling(model, x_t)
-            pre_noise, predicted = noise_scheduler.native_sampling2(model, scene)
+            pre_noise, predicted = noise_scheduler.native_sampling2(model, scene, observe)
 
             # 保存到列表
             predictions.append(predicted.cpu().numpy())
@@ -425,7 +425,7 @@ def evaluate_model(model_path, data_dir, output_dir, device='cuda'):
 
     # 1. 加载模型
     print("\n1. Loading model...")
-    model = load_model(model_path, in_channels=3, )
+    model = load_model(model_path, in_channels=2, )
     if model is None:
         return
 

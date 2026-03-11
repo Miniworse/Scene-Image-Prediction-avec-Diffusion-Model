@@ -279,7 +279,9 @@ def train_model(model, train_loader, val_loader, model_dir, log_dir, epochs=50, 
     model = model.to(device)
     criterion = nn.MSELoss()  # 使用均方误差损失
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5)
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda epoch: 1.0)
+
+    # scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5)
 
     train_losses = []
     val_losses = []
@@ -303,9 +305,10 @@ def train_model(model, train_loader, val_loader, model_dir, log_dir, epochs=50, 
             t = torch.randint(0, T, (batch_size,)).to(device)
 
             xt, noise = noise_scheduler.forward_diffusion(scene_imgs, t)
+            xt_observe_cat = torch.cat([xt, observe_imgs], dim=1)
 
             optimizer.zero_grad()
-            outputs = model(xt,t)
+            outputs = model(xt_observe_cat, t)
             loss = criterion(outputs, noise)
             loss.backward()
             optimizer.step()
@@ -343,14 +346,16 @@ def train_model(model, train_loader, val_loader, model_dir, log_dir, epochs=50, 
             torch.save(model.state_dict(), model_dir)
             print(f'New best model saved with validation loss: {best_val_loss:.6f}')
 
+            predicted_noise = noise_scheduler.deblur(xt[0], t[0].item(),outputs[0])
+
             scene_save = scene_imgs[0].cpu().detach().numpy()
             x_t_save = xt[0].cpu().detach().numpy()
             outputs_save = outputs[0].cpu().detach().numpy()
-            noise_save = noise[0].cpu().detach().numpy()
+            predicted_save = predicted_noise.cpu().detach().numpy()
             t_value = t[0].item()
 
             os.makedirs(log_dir, exist_ok=True)
-            np.savez(os.path.join(log_dir, f"train_{epoch}.npz"), **{f"x_{t_value}": x_t_save}, outputs = outputs_save, noise = noise_save, scene = scene_save)
+            np.savez(os.path.join(log_dir, f"train_{epoch}.npz"), **{f"x_{t_value}": x_t_save}, outputs = outputs_save, predicted = predicted_save, scene = scene_save)
 
 
         scheduler.step(avg_train_loss)
@@ -502,12 +507,14 @@ def main(args):
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
     # 确定输入通道数
-    sample_scene, _ = next(iter(train_loader))
-    in_channels = sample_scene.shape[1]
+    sample_scene, sample_observe = next(iter(train_loader))
+    input_data =  torch.cat([sample_scene, sample_observe], dim=1)
+    in_channels = input_data.shape[1]
+    out_channels = sample_scene.shape[1]
     print(f"\nInput channels: {in_channels}")
 
     # 创建模型
-    model = UNet(n_channels=in_channels, n_classes=in_channels, time_emb_dim=64)
+    model = UNet(n_channels=in_channels, n_classes=out_channels, time_emb_dim=64)
 
     # 打印模型结构
     print(f"\nModel architecture:")

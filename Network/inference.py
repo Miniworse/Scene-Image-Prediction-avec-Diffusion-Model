@@ -21,7 +21,7 @@ warnings.filterwarnings('ignore')
 
 
 # 1. 加载训练好的模型
-def load_model(model_path, in_channels=3):
+def load_model(model_path, in_channels=3, out_channels=3):
     """加载训练好的模型"""
 
     # 重新定义UNet类（与训练时相同）
@@ -152,7 +152,7 @@ def load_model(model_path, in_channels=3):
             return self.conv(x)
 
     # 创建模型并加载权重
-    model = UNet(n_channels=in_channels, n_classes=in_channels, time_emb_dim=64)
+    model = UNet(n_channels=in_channels, n_classes=out_channels, time_emb_dim=64)
 
     if os.path.exists(model_path):
         if model_path.endswith('.pth'):
@@ -253,33 +253,46 @@ def predict_and_save(model, dataset, output_dir, device='cuda'):
         for scene, observe, index in tqdm(dataset, desc="Predicting"):
             scene = scene.unsqueeze(0).to(device)  # 添加batch维度
             observe = observe.unsqueeze(0).to(device)
-
+            if index == '0001':
+                flag = True
+            else:
+                flag = False
             # 预测
             x_t =  torch.randn_like(scene).to(device)
-            # pre_noise, predicted  = noise_scheduler.sampling(model, x_t)
-            pre_noise, predicted = noise_scheduler.native_sampling2(model, scene, observe)
+            # pre_noise, predicted  = noise_scheduler.sampling(model, x_t, observe)
+            pre_noise, predicted = noise_scheduler.native_sampling2(model, scene, observe,flag)
+            # pre_noise, predicted = noise_scheduler.fast_sampling(model, scene, observe)
 
             # 保存到列表
             predictions.append(predicted.cpu().numpy())
-            ground_truths.append(observe.numpy())
+            ground_truths.append(observe.cpu().numpy())
             inputs.append(scene.cpu().numpy())
             indices.append(index)
 
-            # 保存为.npy文件
-            pred_np = predicted.squeeze(0).cpu().numpy()  # 移除batch维度
+            # 这里也保存为npz包含场景、观测、预测与预测噪声四个子图
+            pred_save = predicted.squeeze(0).cpu().numpy()  # 移除batch维度
+            scene_save = scene.squeeze(0).cpu().numpy()
+            observe_save = observe.squeeze(0).cpu().numpy()
+            noise_save = pre_noise.squeeze(0).cpu().numpy()
 
-            # 保存预测结果
-            pred_filename = f"predicted_{index}.npy"
-            pred_path = os.path.join(output_dir, pred_filename)
-            np.save(pred_path, pred_np)
+            np.savez(os.path.join(output_dir, f"predicted_{index}.npz"), outputs=pred_save,
+                     observe=observe_save, scene=scene_save, noise=noise_save)
 
-            # 如果需要，也可以保存为图像
-            if pred_np.shape[0] == 3:  # 3通道图像
-                img_np = pred_np.transpose(1, 2, 0)
-                img_np = np.clip(img_np * 255, 0, 255).astype(np.uint8)
-                img_filename = f"predicted_{index}.png"
-                img_path = os.path.join(output_dir, img_filename)
-                Image.fromarray(img_np).save(img_path)
+            # # 保存为.npy文件
+            # pred_np = predicted.squeeze(0).cpu().numpy()  # 移除batch维度
+            #
+            # # 保存预测结果
+            # pred_filename = f"predicted_{index}.npy"
+            # pred_path = os.path.join(output_dir, pred_filename)
+            # np.save(pred_path, pred_np)
+            #
+            # # 如果需要，也可以保存为图像
+            # if pred_np.shape[0] == 3:  # 3通道图像
+            #     img_np = pred_np.transpose(1, 2, 0)
+            #     img_np = np.clip(img_np * 255, 0, 255).astype(np.uint8)
+            #     img_filename = f"predicted_{index}.png"
+            #     img_path = os.path.join(output_dir, img_filename)
+            #     Image.fromarray(img_np).save(img_path)
 
     print(f"\nPredictions saved to {output_dir}")
 
@@ -425,7 +438,7 @@ def evaluate_model(model_path, data_dir, output_dir, device='cuda'):
 
     # 1. 加载模型
     print("\n1. Loading model...")
-    model = load_model(model_path, in_channels=2, )
+    model = load_model(model_path, in_channels=2, out_channels=1)
     if model is None:
         return
 

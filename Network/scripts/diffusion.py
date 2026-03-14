@@ -81,7 +81,7 @@ class NoiseScheduler:
                 output_dir = f'./output/t_sample'
                 os.makedirs(output_dir, exist_ok=True)
                 pred_path = os.path.join(output_dir, f"x_{t.item()}.npy")
-                np.save(pred_path, x_t)
+                np.save(pred_path, x_t[0].detach().cpu().numpy())
 
 
         return pre_noise, predicted

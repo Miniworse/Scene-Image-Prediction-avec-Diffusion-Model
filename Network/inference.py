@@ -94,7 +94,7 @@ def predict_and_save(model, dataset, output_dir, device='cuda'):
     inputs = []
     indices = []
 
-    betas = diffusion.linear_beta_schedule(1000)
+    betas = diffusion.get_beta_schedule(1000)
     noise_scheduler = diffusion.NoiseScheduler(betas, device)
 
     with torch.no_grad():
@@ -108,13 +108,13 @@ def predict_and_save(model, dataset, output_dir, device='cuda'):
             # 预测
             x_t =  torch.randn_like(scene).to(device)
             # pre_noise, predicted  = noise_scheduler.sampling(model, x_t, observe)
-            pre_noise, predicted = noise_scheduler.native_sampling2(model, scene, observe,flag)
-            # pre_noise, predicted = noise_scheduler.fast_sampling(model, scene, observe)
+            # pre_noise, predicted = noise_scheduler.native_sampling2(model, scene, observe, flag)
+            pre_noise, predicted = noise_scheduler.fast_sampling(model, scene, observe)
 
             # 保存到列表
             predictions.append(predicted.cpu().numpy())
-            ground_truths.append(observe.cpu().numpy())
-            inputs.append(scene.cpu().numpy())
+            ground_truths.append(scene.cpu().numpy())
+            inputs.append(observe.cpu().numpy())
             indices.append(index)
 
             # 这里也保存为npz包含场景、观测、预测与预测噪声四个子图
@@ -166,8 +166,8 @@ def calculate_ssim(pred, target, data_range=1.0):
             pred_img = pred[i].transpose(1, 2, 0)
             target_img = target[i].transpose(1, 2, 0)
         else:
-            pred_img = pred[i]
-            target_img = target[i]
+            pred_img = pred[i].squeeze(0)
+            target_img = target[i].squeeze(0)
 
         # 如果有多通道，计算多通道SSIM
         if len(pred_img.shape) == 3 and pred_img.shape[-1] == 3:
@@ -343,8 +343,8 @@ def evaluate_model(model_path, data_dir, output_dir, device='cuda'):
     print(f"FID Score: {fid_score:.2f}")
 
     # 6. 可视化结果
-    print("\n6. Visualizing results...")
-    visualize_results(inputs, ground_truths, predictions, output_dir, indices[:4])
+    # print("\n6. Visualizing results...")
+    # visualize_results(inputs, ground_truths, predictions, output_dir, indices[:4])
 
     # 7. 保存评估结果
     print("\n7. Saving evaluation results...")

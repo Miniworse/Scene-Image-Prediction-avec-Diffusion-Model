@@ -156,7 +156,7 @@ def train_model(model, train_loader, val_loader, model_dir, log_dir, epochs=50, 
     best_model_state = None
 
     T = 1000  # Total timesteps
-    betas = diffusion.linear_beta_schedule(T)
+    betas = diffusion.get_beta_schedule(T)
     noise_scheduler = diffusion.NoiseScheduler(betas, device=device)
 
     for epoch in range(epochs):
@@ -250,71 +250,89 @@ def train_model(model, train_loader, val_loader, model_dir, log_dir, epochs=50, 
 
 
 # 5. 测试和可视化函数
-def test_and_visualize(model, test_loader, device='cuda', num_samples=4):
+def test_and_visualize(model, test_loader, log_dir, device='cuda', num_samples=4):
     model.eval()
     criterion = nn.MSELoss()
     test_loss = 0.0
-    betas = diffusion.linear_beta_schedule(1000)
+    betas = diffusion.get_beta_schedule(1000)
     noise_scheduler = diffusion.NoiseScheduler(betas, device)
 
+    flag = True
     with torch.no_grad():
-        for scene_imgs, observe_imgs in test_loader:
+        for index, (scene_imgs, observe_imgs) in enumerate(test_loader):
             scene_imgs, observe_imgs = scene_imgs.to(device), observe_imgs.to(device)
-            pre_noise, predicted = noise_scheduler.native_sampling2(model, scene_imgs)
+
+            # pre_noise, predicted = noise_scheduler.native_sampling2(model, scene_imgs, observe_imgs, flag=flag)
+            pre_noise, predicted = noise_scheduler.fast_sampling(model, scene_imgs, observe_imgs)
+            # pre_noise, predicted = noise_scheduler.ddim_sample(model, scene_imgs, observe_imgs)
+
+
+            flag = False
             loss = criterion(predicted, scene_imgs)
             test_loss += loss.item()
+
+            scene_np = scene_imgs[0].cpu().numpy()
+            observe_np = observe_imgs[0].cpu().numpy()
+            predicted_np = predicted.detach().squeeze(0).cpu().numpy()
+            noise_np = pre_noise.detach().squeeze(0).cpu().numpy()
+
+            np.savez(os.path.join(log_dir, f"tested_{index}.npz"), outputs=predicted_np,
+                     observe=observe_np, scene=scene_np, noise=noise_np)
 
     avg_test_loss = test_loss / len(test_loader)
     print(f'Test Loss: {avg_test_loss:.6f}')
 
-    # 可视化一些结果
-    scene_imgs, observe_imgs = next(iter(test_loader))
-    scene_imgs, observe_imgs = scene_imgs.to(device), observe_imgs.to(device)
-    predicted = model(scene_imgs[:num_samples])  # 预测前几个样本
-
-    # 转换为numpy用于显示
-    scene_np = scene_imgs[:num_samples].cpu().numpy()
-    observe_np = observe_imgs[:num_samples].cpu().numpy()
-    predicted_np = predicted.detach().cpu().numpy()
-
-    # 如果通道在第一个维度，调整为最后一个维度用于显示
-    if scene_np.shape[1] == 3:  # (B, C, H, W)
-        scene_np = scene_np.transpose(0, 2, 3, 1)
-        observe_np = observe_np.transpose(0, 2, 3, 1)
-        predicted_np = predicted_np.transpose(0, 2, 3, 1)
-
-    # 显示结果
-    fig, axes = plt.subplots(num_samples, 3, figsize=(12, 4 * num_samples))
-    if num_samples == 1:
-        axes = axes.reshape(1, -1)
-
-    for i in range(num_samples):
-        # 确保值在[0,1]范围内
-        scene_img = np.clip(scene_np[i], 0, 1)
-        observe_img = np.clip(observe_np[i], 0, 1)
-        predicted_img = np.clip(predicted_np[i], 0, 1)
-
-        # 如果图像是单通道，转换为3通道显示
-        if len(scene_img.shape) == 2:
-            scene_img = np.stack([scene_img] * 3, axis=-1)
-            observe_img = np.stack([observe_img] * 3, axis=-1)
-            predicted_img = np.stack([predicted_img] * 3, axis=-1)
-
-        axes[i, 0].imshow(scene_img)
-        axes[i, 0].set_title('Scene (Clean Input)')
-        axes[i, 0].axis('off')
-
-        axes[i, 1].imshow(observe_img)
-        axes[i, 1].set_title('Observe (Ground Truth Noisy)')
-        axes[i, 1].axis('off')
-
-        axes[i, 2].imshow(predicted_img)
-        axes[i, 2].set_title('Predicted Noisy')
-        axes[i, 2].axis('off')
-
-    plt.tight_layout()
-    plt.savefig('test_results.png', dpi=300, bbox_inches='tight')
-    plt.show()
+    # # 可视化一些结果
+    # scene_imgs, observe_imgs = next(iter(test_loader))
+    # scene_imgs, observe_imgs = scene_imgs.to(device), observe_imgs.to(device)
+    # for index, (scene_imgs, observe_imgs) in enumerate(test_loader):
+    #     pre_noise, predicted = noise_scheduler.native_sampling2(model, scene_imgs, observe_imgs)
+    #     predicted = model(scene_imgs[:num_samples])  # 预测前几个样本
+    #
+    #
+    # # 转换为numpy用于显示
+    # scene_np = scene_imgs[:num_samples].cpu().numpy()
+    # observe_np = observe_imgs[:num_samples].cpu().numpy()
+    # predicted_np = predicted.detach().cpu().numpy()
+    #
+    # # 如果通道在第一个维度，调整为最后一个维度用于显示
+    # if scene_np.shape[1] == 3:  # (B, C, H, W)
+    #     scene_np = scene_np.transpose(0, 2, 3, 1)
+    #     observe_np = observe_np.transpose(0, 2, 3, 1)
+    #     predicted_np = predicted_np.transpose(0, 2, 3, 1)
+    #
+    # # 显示结果
+    # fig, axes = plt.subplots(num_samples, 3, figsize=(12, 4 * num_samples))
+    # if num_samples == 1:
+    #     axes = axes.reshape(1, -1)
+    #
+    # for i in range(num_samples):
+    #     # 确保值在[0,1]范围内
+    #     scene_img = np.clip(scene_np[i], 0, 1)
+    #     observe_img = np.clip(observe_np[i], 0, 1)
+    #     predicted_img = np.clip(predicted_np[i], 0, 1)
+    #
+    #     # 如果图像是单通道，转换为3通道显示
+    #     if len(scene_img.shape) == 2:
+    #         scene_img = np.stack([scene_img] * 3, axis=-1)
+    #         observe_img = np.stack([observe_img] * 3, axis=-1)
+    #         predicted_img = np.stack([predicted_img] * 3, axis=-1)
+    #
+    #     axes[i, 0].imshow(scene_img)
+    #     axes[i, 0].set_title('Scene (Clean Input)')
+    #     axes[i, 0].axis('off')
+    #
+    #     axes[i, 1].imshow(observe_img)
+    #     axes[i, 1].set_title('Observe (Ground Truth Noisy)')
+    #     axes[i, 1].axis('off')
+    #
+    #     axes[i, 2].imshow(predicted_img)
+    #     axes[i, 2].set_title('Predicted Noisy')
+    #     axes[i, 2].axis('off')
+    #
+    # plt.tight_layout()
+    # plt.savefig('test_results.png', dpi=300, bbox_inches='tight')
+    # plt.show()
 
     return avg_test_loss
 
@@ -414,8 +432,9 @@ def main(args):
     )
 
     # 测试模型
-    # print(f"\nTesting model...")
-    # test_loss = test_and_visualize(model, test_loader, device, num_samples=num_workers)
+    print(f"\nTesting model...")
+    test_loss = test_and_visualize(model, test_loader, log_dir, device, num_samples=num_workers)
+    # print(f'Test loss: {test_loss: .6f} \n')
 
     # 保存模型
     torch.save(model.state_dict(), model_dir)

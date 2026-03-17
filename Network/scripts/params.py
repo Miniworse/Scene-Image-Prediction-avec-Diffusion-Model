@@ -20,8 +20,9 @@ class AttrDict(dict):
 params_all = AttrDict(
     task_id=1,
     log_dir='./trainlog',
-    model_dir='./model/Mar12-085335.pth',
+    model_dir='./model/Mar16-022958.pth',
     data_dir='../data/data15Janv/TB',
+    # data_dir='../data/data4debug',
     output_dir='./output',
 
     cond_dir=['./dataset/fmcw/cond'],
@@ -33,9 +34,9 @@ params_all = AttrDict(
     epochs=100,
     learning_rate=1e-3,
     max_grad_norm=None,
-    train_ratio=0.8,
-    test_ratio=0.1,
-    val_ratio=0.1,
+    train_ratio=0.95,
+    test_ratio=0.04,
+    val_ratio=0.01,
     seed=None, # 42
     num_workers=4,
     # Inference params

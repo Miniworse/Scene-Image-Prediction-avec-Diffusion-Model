@@ -72,10 +72,10 @@ class PredictDataset:
 
         # 归一化
         if self.normalize:
-            # scene_tensor = scene_tensor / 255.0 if scene_tensor.max() > 1.0 else scene_tensor
-            # observe_tensor = observe_tensor / 255.0 if observe_tensor.max() > 1.0 else observe_tensor
-            scene_tensor = t_normalize(scene_tensor)
-            observe_tensor = t_normalize(observe_tensor)
+            scene_tensor = torch.clamp(scene_tensor / 150.0 - 1.0, -1.0, 1.0)
+            observe_tensor = torch.clamp(observe_tensor / 150.0 - 1.0, -1.0, 1.0)
+            # scene_tensor = t_normalize(scene_tensor)
+            # observe_tensor = t_normalize(observe_tensor)
 
         return scene_tensor, observe_tensor, index
 
@@ -500,7 +500,7 @@ def main():
 
     # 配置路径
     model_path = params.model_dir
-    data_dir = params.data_dir
+    data_dir = params.test_dir
     output_dir = params.output_dir
 
     model_name = os.path.splitext(os.path.basename(model_path))[0]

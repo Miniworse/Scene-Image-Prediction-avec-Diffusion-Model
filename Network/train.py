@@ -85,11 +85,11 @@ class SceneObserveDataset(Dataset):
 
         # 数据归一化（可选）
         if self.normalize:
-            # scene_tensor = scene_tensor / 255.0 if scene_tensor.max() > 1.0 else scene_tensor
-            # observe_tensor = observe_tensor / 255.0 if observe_tensor.max() > 1.0 else observe_tensor
+            scene_tensor = torch.clamp(scene_tensor / 150.0 - 1.0, -1.0, 1.0)
+            observe_tensor = torch.clamp(observe_tensor / 150.0 - 1.0, -1.0, 1.0)
             # 在辐射计场景下的归一化操作？
-            scene_tensor = t_normalize(scene_tensor)
-            observe_tensor = t_normalize(observe_tensor)
+            # scene_tensor = t_normalize(scene_tensor)
+            # observe_tensor = t_normalize(observe_tensor)
 
 
         # 数据增强（如果指定）
@@ -273,8 +273,8 @@ def test_and_visualize(model, test_loader, log_dir, device='cuda', num_samples=4
 
             scene_np = scene_imgs[0].cpu().numpy()
             observe_np = observe_imgs[0].cpu().numpy()
-            predicted_np = predicted.detach().squeeze(0).cpu().numpy()
-            noise_np = pre_noise.detach().squeeze(0).cpu().numpy()
+            predicted_np = predicted[0].detach().squeeze(0).cpu().numpy()
+            noise_np = pre_noise[0].detach().squeeze(0).cpu().numpy()
 
             np.savez(os.path.join(log_dir, f"tested_{index}.npz"), outputs=predicted_np,
                      observe=observe_np, scene=scene_np, noise=noise_np)

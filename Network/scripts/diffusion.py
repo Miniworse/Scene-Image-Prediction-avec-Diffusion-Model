@@ -107,7 +107,7 @@ class NoiseScheduler:
         return pre_noise, predicted
 
     @torch.no_grad()
-    def ddim_sample(self, model, x_0, y, steps=1000, eta=0.0):
+    def ddim_sampling(self, model, x_0, y, steps=1000, eta=0.0):
         """
         DDIM采样，eta控制随机性
         eta=0: 确定性采样（更快，更平滑）
@@ -122,7 +122,7 @@ class NoiseScheduler:
         else:
             sample_model = model
 
-        for i in range(999, -1, -1):
+        for i in range(steps-1, -1, -1):
             t = torch.full((x_t.shape[0],), i, device=x_t.device, dtype=torch.long)
 
             x_t_y = torch.cat((x_t, y), dim=1)

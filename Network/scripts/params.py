@@ -21,8 +21,10 @@ params_all = AttrDict(
     task_id=1,
     log_dir='./trainlog',
     model_dir='./model/Mar16-022958.pth',
-    data_dir='../data/data15Janv/TB',
-    # data_dir='../data/data4debug',
+    # data_dir='../data/data15Janv/TB',
+    data_dir='../data/data4debug',
+    # test_dir='../data/data15Janv/TB',
+    test_dir='../data/data4debug',
     output_dir='./output',
 
     cond_dir=['./dataset/fmcw/cond'],

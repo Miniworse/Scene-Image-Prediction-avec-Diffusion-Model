@@ -176,8 +176,8 @@ class UNet(nn.Module):
 
         # 输出层
         self.outc = nn.Sequential(
-            nn.GroupNorm(min(8, 64), 64),
-            nn.SiLU(),
+            # nn.GroupNorm(min(8, 64), 64),
+            # nn.SiLU(),
             nn.Conv2d(64, n_classes, kernel_size=1)
         )
 

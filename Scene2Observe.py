@@ -13,8 +13,8 @@ try:
 
     Param = eng.Param4python()
 
-    source_dir = 'data\\data15Janv\\Binary'
-    output_dir = 'data\\data15Janv\\TB'
+    source_dir = 'data\\data17Mars\\Binary'
+    output_dir = 'data\\data17Mars\\TB'
     os.makedirs(output_dir, exist_ok=True)
 
     npy_files = [f for f in os.listdir(source_dir) if f.endswith('.npy')]
@@ -40,7 +40,7 @@ try:
         scene_TB = original_data * 90
         scene_TB = np.array(scene_TB, dtype=np.double)
 
-        observe_TB = eng.TB4python(Param, scene_TB)
+        _, observe_TB = eng.TB4python(Param, scene_TB, nargout=2)
         observe_TB = np.array(observe_TB, dtype=np.double)
         # res = np.array(res, dtype=np.complex128)
         # R = np.array(R, dtype=np.complex128)

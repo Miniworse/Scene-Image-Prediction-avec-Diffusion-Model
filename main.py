@@ -143,11 +143,11 @@ if __name__ == '__main__':
     # 生成场景
     print("生成随机形状场景...")
 
-    save_dir = 'data\\data17Mars\\Binary'
+    save_dir = 'data\\data20Mars\\Binary'
     os.makedirs(save_dir, exist_ok=True)
 
     # 生成数据总数
-    total_scenes = 100
+    total_scenes = 10
 
     for scene_num in range(1, total_scenes + 1):
         print(f"\r正在生成第 {scene_num}/{total_scenes} 个场景...", end="")

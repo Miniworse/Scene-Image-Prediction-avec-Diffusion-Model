@@ -20,7 +20,7 @@ class AttrDict(dict):
 params_all = AttrDict(
     task_id=1,
     log_dir='./trainlog',
-    model_dir='./model/Mar16-022958.pth',
+    model_dir='./model/Apr06-161715.pth',
     # data_dir='../data/data15Janv/TB',
     data_dir='../data/data4debug',
     # test_dir='../data/data15Janv/TB',
@@ -32,8 +32,8 @@ params_all = AttrDict(
     fid_data_dir = './dataset/fmcw/img_matric/data',
     # Training params
     max_iter=None, # Unlimited number of iterations.
-    batch_size=8,
-    epochs=100,
+    batch_size=1,
+    epochs=20,
     learning_rate=1e-3,
     max_grad_norm=None,
     train_ratio=0.95,

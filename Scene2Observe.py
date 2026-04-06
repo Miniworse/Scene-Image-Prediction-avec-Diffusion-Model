@@ -13,8 +13,8 @@ try:
 
     Param = eng.Param4python()
 
-    source_dir = 'data\\data17Mars\\Binary'
-    output_dir = 'data\\data17Mars\\TB'
+    source_dir = 'D:\Documents\Self_Files\Projects\SceneGenerating2\output_smos_simulation_test\\npy_files'
+    output_dir = 'D:\Documents\Self_Files\Projects\SceneGenerating2\output_smos_simulation_test\\npy_files'
     os.makedirs(output_dir, exist_ok=True)
 
     npy_files = [f for f in os.listdir(source_dir) if f.endswith('.npy')]
@@ -37,7 +37,7 @@ try:
         original_data = np.load(filepath)
 
         # 乘以90
-        scene_TB = original_data * 90
+        scene_TB = original_data
         scene_TB = np.array(scene_TB, dtype=np.double)
 
         _, observe_TB = eng.TB4python(Param, scene_TB, nargout=2)

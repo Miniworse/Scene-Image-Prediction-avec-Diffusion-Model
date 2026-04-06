@@ -1,12 +1,13 @@
 import torch
 import numpy as np
 import os
-import tqdm
+# import tqdm
 from sympy.polys.matrices.dense import ddm_iinv
+from tqdm import tqdm
 
 
 # Define the beta schedule
-def get_beta_schedule(timesteps, schedule_type='linear'):
+def get_beta_schedule(timesteps, schedule_type='sqrt'):
     if schedule_type == 'linear':
         start = 1e-4; end = 0.02
         beta = torch.linspace(start, end, timesteps)
@@ -18,10 +19,10 @@ def get_beta_schedule(timesteps, schedule_type='linear'):
         alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * torch.pi * 0.5) ** 2
         alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
         beta = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-        beta = torch.clip(beta, 0, 0.999)
+        beta = torch.clip(beta, 0.0001, 0.9999)
 
     elif schedule_type == 'sqrt':
-        beta = torch.linspace(1e-4, 0.02, timesteps) ** 2
+        beta = torch.linspace(1e-4 ** 0.5, 0.02 ** 0.5, timesteps) ** 2
 
     else:
         beta = torch.linspace(1e-4, 0.02, timesteps)
@@ -32,6 +33,7 @@ def get_beta_schedule(timesteps, schedule_type='linear'):
 class NoiseScheduler:
     def __init__(self, betas, device = torch.device('cpu')):
         self.betas = betas
+        self.T = len(betas)
         self.device = device
         self.alphas = 1. - self.betas
         self.alphas_cumprod = torch.cumprod(self.alphas, axis=0).to(device)
@@ -50,6 +52,10 @@ class NoiseScheduler:
         x0 = (xt - sqrt_one_minus_alphas_cumprod_t * noise) / sqrt_alphas_cumprod_t
         return x0
 
+    def get_snr(self, t):
+        at = self.alphas_cumprod[t].view(-1, 1, 1, 1)
+        return at/(1-at)
+
     # Forward diffusion process
     def forward_diffusion(self, x0, t):
         noise = torch.randn_like(x0)
@@ -57,15 +63,18 @@ class NoiseScheduler:
         return xt, noise
 
     def fast_sampling(self, model, x_0, y):
-        t = torch.tensor([999]).to(self.device)
+        t = torch.tensor([self.T - 1]).to(self.device)
         x_t = torch.randn_like(x_0).to(self.device)
-        x_t_y = torch.cat((x_t, y), dim=1)
+        y_noise = torch.randn_like(y).to(self.device)
+        y_t = self.add_noise(y, t, y_noise)
+        x_t_y = torch.cat((x_t, y_t), dim=1)
         pre_noise = model(x_t_y, t)
+
         predicted = self.deblur(x_t, t, pre_noise)
         return pre_noise, predicted
 
     def sampling(self, model, x_t, y):
-        for i in range(999, -1, -1):
+        for i in range(self.T - 1, -1, -1):
             t = torch.tensor([i]).to(self.device)
             x_t_y = torch.cat((x_t, y), dim=1)
             pre_noise = model(x_t_y, t)
@@ -77,7 +86,7 @@ class NoiseScheduler:
         return pre_noise, predicted
 
     def native_sampling(self, model, x_0, y):
-        t = torch.tensor([999]).to(self.device)
+        t = torch.tensor([500]).to(self.device)
         x_t = self.add_noise(x_0, t, noise=torch.randn_like(x_0))
         x_t_y = torch.cat((x_t, y), dim=1)
         pre_noise = model(x_t_y, t)
@@ -86,13 +95,15 @@ class NoiseScheduler:
         return pre_noise, predicted
 
     def native_sampling2(self, model, x_0, y, flag = False):
-        x_t = self.add_noise(x_0, torch.tensor([999]), noise=torch.randn_like(x_0))
-
-        for i in range(999, -1, -1):
+        x_t = self.add_noise(x_0, torch.tensor([self.T - 1]), noise=torch.randn_like(x_0))
+        # x_t=torch.randn_like(x_0)
+        
+        for i in range(self.T - 1, -1, -1):
             t = torch.tensor([i]).to(self.device)
             x_t_y = torch.cat((x_t, y), dim=1)
             pre_noise = model(x_t_y, t)
             x_0 = self.deblur(x_t, t, pre_noise)
+            # x_0 = torch.clamp(x_0, -2.0, 2.0) # Use your [-2, 2] range
             if i>0:
                 x_t = self.add_noise(x_0, t = torch.tensor([i-1]), noise=pre_noise)
             predicted = x_0
@@ -115,40 +126,51 @@ class NoiseScheduler:
         """
         model.eval()
         x_t = torch.randn_like(x_0).to(self.device)
+        y_noise = torch.randn_like(y)
 
-        # 使用EMA模型
-        if hasattr(model, 'ema_model'):
-            sample_model = model.ema_model
-        else:
-            sample_model = model
+        for i in tqdm(reversed(range(0, steps)), desc='DDIM'):
+            t = torch.full((x_t.shape[0],), i, device=self.device, dtype=torch.long)
 
-        for i in range(steps-1, -1, -1):
-            t = torch.full((x_t.shape[0],), i, device=x_t.device, dtype=torch.long)
+            # 1. Predict Noise
+            y_t = self.add_noise(y, t, y_noise)
+            x_t_y = torch.cat((x_t, y_t), dim=1)
+            pred_noise = model(x_t_y, t)
 
-            x_t_y = torch.cat((x_t, y), dim=1)
-            # 预测噪声
-            pred_noise = sample_model(x_t_y, t)
+            # 2. Get Alphas and reshape for 4D broadcasting
+            at = self.alphas_cumprod[i].view(-1, 1, 1, 1)
+            at_prev = (self.alphas_cumprod[i - 1] if i > 0 else torch.tensor(1.0)).view(-1, 1, 1, 1).to(self.device)
 
-            # 预测x0
-            # x_0 = self.deblur(x_t, t, pred_noise)
-            alpha_cumprod_t = self.alphas_cumprod[i].to(x_t.device)
-            alpha_cumprod_t_prev = self.alphas_cumprod[i - 1].to(x_t.device) if i > 0 else torch.tensor(1.0).to(
-                x_t.device)
-
-            pred_x0 = (x_t - torch.sqrt(1 - alpha_cumprod_t) * pred_noise) / torch.sqrt(alpha_cumprod_t)
+            # 3. Estimate x0 (The "predicted x0")
+            # Formula: (x_t - sqrt(1 - alpha_t) * epsilon) / sqrt(alpha_t)
+            sqrt_one_minus_at = torch.sqrt(1 - at)
+            pred_x0 = (x_t - sqrt_one_minus_at * pred_noise) / torch.sqrt(at)
+            # x_t = pred_x0
+            # break
+            # OPTIONAL: pred_x0 = torch.clamp(pred_x0, -2, 2)
+            # Since you said clamping made it worse, keep it commented but watch it.
 
             if i > 0:
-                # DDIM step
-                sigma = eta * torch.sqrt((1 - alpha_cumprod_t_prev) / (1 - alpha_cumprod_t)) * \
-                        torch.sqrt(1 - alpha_cumprod_t / alpha_cumprod_t_prev)
+                # 4. Calculate Sigma (randomness)
+                # sigma = eta * sqrt((1 - at_prev)/(1 - at) * (1 - at/at_prev))
+                sigma = eta * torch.sqrt((1 - at_prev) / (1 - at) * (1 - at / at_prev))
 
-                c1 = torch.sqrt(alpha_cumprod_t_prev)
-                c2 = torch.sqrt(1 - alpha_cumprod_t_prev - sigma ** 2)
+                # 5. Direction pointing to x_t
+                # c2 is the weight for the noise (direction)
+                c2 = torch.sqrt(1 - at_prev - sigma ** 2)
 
-                noise = torch.randn_like(x_t) if eta > 0 else 0
-                x_t = c1 * pred_x0 + c2 * pred_noise + sigma * noise
+                random_noise = torch.randn_like(x_t) if eta > 0 else 0
+                x_t = torch.sqrt(at_prev) * pred_x0 + c2 * pred_noise + sigma * random_noise
+                # break
             else:
                 x_t = pred_x0
+
+            flag = True
+            if i % 10 == 0 & flag:
+                # 写一个小接口，
+                output_dir = f'./output/t_sample_ddim_V5'
+                os.makedirs(output_dir, exist_ok=True)
+                pred_path = os.path.join(output_dir, f"x_{t.item()}.npy")
+                np.save(pred_path, x_t[0].detach().cpu().numpy())
 
         return pred_noise, x_t #torch.clamp(x_t, -1, 1)
 
@@ -158,6 +180,8 @@ class NoiseScheduler:
     #
     # # 方案B: 增加采样步数（质量更好，但更慢）
     # samples = ddim_sample(model, scheduler, noise, steps=200, eta=0.5)
+
+
 
 
 # # Example usage

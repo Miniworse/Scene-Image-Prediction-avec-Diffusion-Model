@@ -113,6 +113,6 @@ def visualize_and_save_npy_files(folder_path, save_dir="./visualizations", cmap=
 
 
 # 使用示例
-folder_path = "D:\Documents\Self_Files\Projects\SceneGenerating\\Network\\output\Mar20-025648_TB_test"  # 输入文件夹路径
+folder_path = "D:\Documents\Self_Files\Projects\SceneGenerating\\Network\\output/t_sample_ddim_V5"  # 输入文件夹路径
 save_dir = f"./output_images/{Path(folder_path).name}"  # 自动生成同名子目录
 visualize_and_save_npy_files(folder_path, save_dir=save_dir)

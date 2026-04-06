@@ -18,7 +18,8 @@ from scripts.utils import *
 from scripts.Unet_model import UNet
 
 import scripts.diffusion as diffusion
-
+from  scripts.cal_loss import compute_loss
+from scripts.get_EMA import EMA
 
 # 2. 自定义数据集类 - 适配您的.npy文件格式
 class SceneObserveDataset(Dataset):
@@ -85,12 +86,14 @@ class SceneObserveDataset(Dataset):
 
         # 数据归一化（可选）
         if self.normalize:
-            scene_tensor = torch.clamp(scene_tensor / 150.0 - 1.0, -1.0, 1.0)
-            observe_tensor = torch.clamp(observe_tensor / 150.0 - 1.0, -1.0, 1.0)
+            # scene_tensor = torch.clamp(scene_tensor / 500.0, -1.0, 1.0)
+            # observe_tensor = torch.clamp(observe_tensor / 500.0, -1.0, 1.0)
             # 在辐射计场景下的归一化操作？
             # scene_tensor = t_normalize(scene_tensor)
             # observe_tensor = t_normalize(observe_tensor)
 
+            scene_tensor = (scene_tensor - scene_tensor.mean()) / scene_tensor.std()
+            observe_tensor = (observe_tensor - observe_tensor.mean()) / observe_tensor.std()
 
         # 数据增强（如果指定）
         if self.transform:
@@ -142,21 +145,24 @@ def split_dataset(data_dir, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, se
 
 # 4. 训练函数
 def train_model(model, train_loader, val_loader, model_dir, log_dir, epochs=50, lr=0.001, device='cpu'):
+    ema = EMA(model, decay=0.999)
     model = model.to(device)
     criterion = nn.MSELoss()  # 使用均方误差损失
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    # scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda epoch: 1.0)
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda epoch: 1.0)
 
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5)
+    # scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5)
 
     train_losses = []
     val_losses = []
+    pre_std = []
+    t_index = []
 
     best_val_loss = float('inf')
     best_model_state = None
 
     T = 1000  # Total timesteps
-    betas = diffusion.get_beta_schedule(T)
+    betas = diffusion.get_beta_schedule(T, schedule_type='sqrt')
     noise_scheduler = diffusion.NoiseScheduler(betas, device=device)
 
     for epoch in range(epochs):
@@ -170,14 +176,45 @@ def train_model(model, train_loader, val_loader, model_dir, log_dir, epochs=50, 
             batch_size = len(scene_imgs)
             t = torch.randint(0, T, (batch_size,)).to(device)
 
+            # # Bias toward high noise to force the model to work harder on "blurry" images
+            # t = torch.pow(torch.rand((batch_size,)), 0.7) * 1000
+            # t = t.long().to(device)
+
             xt, noise = noise_scheduler.forward_diffusion(scene_imgs, t)
-            xt_observe_cat = torch.cat([xt, observe_imgs], dim=1)
+            observe_noisy = noise_scheduler.add_noise(observe_imgs, t, torch.randn_like(observe_imgs))
+            xt_observe_cat = torch.cat([xt, observe_noisy], dim=1)
+
+            # t_m = t.float() / noise_scheduler.T
+            outputs = model(xt_observe_cat, t)
+
+            # snr = noise_scheduler.get_snr(t)
+            # snr = snr.view(-1, 1, 1, 1)
+            # weight = torch.clamp(snr, max=5.0)
+            # weight = weight + 0.1
+
+            # loss = (weight * (outputs - noise) ** 2).mean()
+            loss = criterion(outputs, noise)
+
+            # for i in [0, 100, 300, 600, 900]:
+            #     t_test = torch.full((batch_size,), i, device=device)
+            #     xt, noise = noise_scheduler.forward_diffusion(scene_imgs, t_test)
+            #     pred = model(torch.cat([xt, xt], dim=1), t_test)
+            #     print(i, pred.std().item())
+            # bins = [0, 200, 400, 600, 800, 1000]
+            #
+            # for i in range(len(bins) - 1):
+            #     mask = (t >= bins[i]) & (t < bins[i + 1])
+            #     if mask.sum() > 0:
+            #         print(f"{bins[i]}-{bins[i + 1]}:", outputs[mask].std().item())
+
+            # print("t:", t[:5])
+            # # print("snr:", snr[:5].flatten())
+            # print("pred std:", outputs.std().item())
 
             optimizer.zero_grad()
-            outputs = model(xt_observe_cat, t)
-            loss = criterion(outputs, noise)
             loss.backward()
             optimizer.step()
+            ema.update()
             train_loss += loss.item()
 
             if batch_idx % 10 == 0:
@@ -185,6 +222,8 @@ def train_model(model, train_loader, val_loader, model_dir, log_dir, epochs=50, 
 
         avg_train_loss = train_loss / len(train_loader)
         train_losses.append(avg_train_loss)
+        # pre_std.append(outputs.std().item())
+        # t_index.append(t)
 
         # # 验证阶段
         # model.eval()
@@ -246,11 +285,38 @@ def train_model(model, train_loader, val_loader, model_dir, log_dir, epochs=50, 
     plt.savefig(os.path.join(log_dir, 'training_curve.png'), dpi=300, bbox_inches='tight')
     plt.show()
 
-    return model
+    # # 查看std曲线 - 双Y轴
+    # fig, ax1 = plt.subplots(figsize=(10, 5))
+    #
+    # # 左Y轴：t_index
+    # color1 = 'tab:blue'
+    # ax1.set_xlabel('Epoch')
+    # ax1.set_ylabel('t_index', color=color1)
+    # ax1.plot(t_index, label='t_index', color=color1)
+    # ax1.tick_params(axis='y', labelcolor=color1)
+    # ax1.grid(True, alpha=0.3)
+    #
+    # # 右Y轴：pre_std
+    # ax2 = ax1.twinx()
+    # color2 = 'tab:orange'
+    # ax2.set_ylabel('pre_std', color=color2)
+    # ax2.plot(pre_std, label='pre_std', color=color2)
+    # ax2.tick_params(axis='y', labelcolor=color2)
+    #
+    # # 图例合并
+    # lines1, labels1 = ax1.get_legend_handles_labels()
+    # lines2, labels2 = ax2.get_legend_handles_labels()
+    # ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
+    #
+    # plt.title('pre std of t')
+    # plt.savefig(os.path.join(log_dir, 'prestd_curve.png'), dpi=300, bbox_inches='tight')
+    # plt.show()
+
+    return model, ema
 
 
 # 5. 测试和可视化函数
-def test_and_visualize(model, test_loader, log_dir, device='cuda', num_samples=4):
+def test_and_visualize(model, ema, test_loader, log_dir, device='cuda', num_samples=4):
     model.eval()
     criterion = nn.MSELoss()
     test_loss = 0.0
@@ -261,6 +327,7 @@ def test_and_visualize(model, test_loader, log_dir, device='cuda', num_samples=4
     with torch.no_grad():
         for index, (scene_imgs, observe_imgs) in enumerate(test_loader):
             scene_imgs, observe_imgs = scene_imgs.to(device), observe_imgs.to(device)
+
 
             # pre_noise, predicted = noise_scheduler.native_sampling2(model, scene_imgs, observe_imgs, flag=flag)
             pre_noise, predicted = noise_scheduler.fast_sampling(model, scene_imgs, observe_imgs)
@@ -398,7 +465,7 @@ def main(args):
     print(f"\nInput channels: {in_channels}")
 
     # 创建模型
-    model = UNet(n_channels=in_channels, n_classes=out_channels, time_emb_dim=64)
+    model = UNet(n_channels=in_channels, n_classes=out_channels, time_emb_dim=512)
 
     # 打印模型结构
     print(f"\nModel architecture:")
@@ -420,7 +487,7 @@ def main(args):
 
     log_dir = os.path.join(log_dir, model_name)
 
-    model = train_model(
+    model, ema = train_model(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
@@ -433,11 +500,14 @@ def main(args):
 
     # 测试模型
     print(f"\nTesting model...")
-    test_loss = test_and_visualize(model, test_loader, log_dir, device, num_samples=num_workers)
+    test_loss = test_and_visualize(model, ema, test_loader, log_dir, device, num_samples=num_workers)
     # print(f'Test loss: {test_loss: .6f} \n')
 
     # 保存模型
-    torch.save(model.state_dict(), model_dir)
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'ema_state_dict': ema.shadow
+    }, model_dir)
     print('Model weights saved to {}'.format(model_name))
 
     # # 保存完整模型（包括架构）

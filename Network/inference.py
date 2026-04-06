@@ -72,16 +72,18 @@ class PredictDataset:
 
         # 归一化
         if self.normalize:
-            scene_tensor = torch.clamp(scene_tensor / 150.0 - 1.0, -1.0, 1.0)
-            observe_tensor = torch.clamp(observe_tensor / 150.0 - 1.0, -1.0, 1.0)
+            # scene_tensor = torch.clamp(scene_tensor / 50.0 - 3.0, -3.0, 3.0)
+            # observe_tensor = torch.clamp(observe_tensor / 50.0 - 3.0, -3.0, 3.0)
             # scene_tensor = t_normalize(scene_tensor)
             # observe_tensor = t_normalize(observe_tensor)
+            scene_tensor = (scene_tensor - scene_tensor.mean()) / scene_tensor.std()
+            observe_tensor = (observe_tensor - observe_tensor.mean()) / observe_tensor.std()
 
         return scene_tensor, observe_tensor, index
 
 
 # 3. 预测函数
-def predict_and_save(model, dataset, output_dir, device='cuda'):
+def predict_and_save(model, ema, dataset, output_dir, device='cuda'):
     """进行预测并保存结果"""
     model.eval()
     model.to(device)
@@ -106,10 +108,18 @@ def predict_and_save(model, dataset, output_dir, device='cuda'):
             else:
                 flag = False
             # 预测
-            x_t =  torch.randn_like(scene).to(device)
+
+            if ema is not None:
+                ema.apply_shadow()
+
+            # x_t =  torch.randn_like(scene).to(device)
             # pre_noise, predicted  = noise_scheduler.sampling(model, x_t, observe)
             # pre_noise, predicted = noise_scheduler.native_sampling2(model, scene, observe, flag)
-            pre_noise, predicted = noise_scheduler.fast_sampling(model, scene, observe)
+            # pre_noise, predicted = noise_scheduler.fast_sampling(model, scene, observe)
+            pre_noise, predicted = noise_scheduler.ddim_sampling(model, scene, observe, steps=1000, eta=1)
+
+            if ema is not None:
+                ema.restore()
 
             # 保存到列表
             predictions.append(predicted.cpu().numpy())
@@ -286,7 +296,7 @@ def evaluate_model(model_path, data_dir, output_dir, device='cuda'):
 
     # 1. 加载模型
     print("\n1. Loading model...")
-    model = load_model(model_path, in_channels=2, out_channels=1)
+    model, ema = load_model(model_path, in_channels=2, out_channels=1)
     if model is None:
         return
 
@@ -301,7 +311,7 @@ def evaluate_model(model_path, data_dir, output_dir, device='cuda'):
     # 3. 进行预测
     print("\n3. Making predictions...")
     predictions, ground_truths, inputs, indices = predict_and_save(
-        model, dataset, output_dir, device
+        model, ema, dataset, output_dir, device
     )
 
     # 4. 计算SSIM
@@ -529,7 +539,7 @@ def run_prediction_only(model_path, data_dir, output_dir, device='cuda'):
     print("Running prediction only...")
 
     # 加载模型
-    model = load_model(model_path, in_channels=1)
+    model, ema = load_model(model_path, in_channels=1)
     if model is None:
         return
 
@@ -538,7 +548,7 @@ def run_prediction_only(model_path, data_dir, output_dir, device='cuda'):
 
     # 进行预测
     predictions, ground_truths, inputs, indices = predict_and_save(
-        model, dataset, output_dir, device
+        model, ema, dataset, output_dir, device
     )
 
     print(f"\nPrediction completed. {len(predictions)} samples saved to {output_dir}")

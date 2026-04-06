@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .get_EMA import EMA
 
 class DoubleConv(nn.Module):
     """使用GroupNorm替换BN，添加时间嵌入"""
@@ -17,15 +18,20 @@ class DoubleConv(nn.Module):
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
         self.norm2 = nn.GroupNorm(min(8, out_channels), out_channels)
         self.act = nn.SiLU(inplace=True)  # SiLU通常比ReLU好
+        if in_channels != out_channels:
+            self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        else:
+            self.shortcut = nn.Identity()
 
         if time_emb_dim is not None:
             self.time_mlp = nn.Sequential(
                 nn.SiLU(),
-                nn.Linear(time_emb_dim, out_channels)
+                nn.Linear(time_emb_dim, out_channels * 2)
             )
 
     def forward(self, x, t=None):
         # 第一层卷积
+        identity = self.shortcut(x)
         x = self.conv1(x)
         x = self.norm1(x)
         x = self.act(x)
@@ -33,14 +39,19 @@ class DoubleConv(nn.Module):
         # 添加时间嵌入（在第一层卷积后添加效果更好）
         if t is not None and self.time_emb_dim is not None:
             time_emb = self.time_mlp(t)
-            time_emb = time_emb[:, :, None, None]
-            x = x + time_emb  # 简单相加
+            scale, shift = time_emb.chunk(2, dim=1)
+
+            scale = scale[:, :, None, None]
+            shift = shift[:, :, None, None]
+
+            x = x * (1 + scale) + shift
 
         # 第二层卷积
         x = self.conv2(x)
         x = self.norm2(x)
+        # if identity.shape == x.shape:
+        x = x + identity
         x = self.act(x)
-
         return x
 
 
@@ -53,22 +64,37 @@ class SelfAttention(nn.Module):
         self.qkv = nn.Conv2d(channels, channels * 3, kernel_size=1)
         self.proj = nn.Conv2d(channels, channels, kernel_size=1)
 
+    # def forward(self, x):
+    #     B, C, H, W = x.shape
+    #     residual = x
+    #
+    #     x = self.norm(x)
+    #     qkv = self.qkv(x)
+    #     q, k, v = qkv.chunk(3, dim=1)
+    #
+    #     # 计算注意力
+    #     attn = torch.einsum('bchw,bcHW->bhwHW', q, k) * (C ** -0.5)
+    #     attn = attn.flatten(3).softmax(dim=-1).view(B, H, W, H, W)
+    #
+    #     out = torch.einsum('bhwHW,bcHW->bchw', attn, v)
+    #     out = self.proj(out)
+    #
+    #     return residual + out
+
     def forward(self, x):
         B, C, H, W = x.shape
         residual = x
-
         x = self.norm(x)
-        qkv = self.qkv(x)
-        q, k, v = qkv.chunk(3, dim=1)
+        qkv = self.qkv(x).view(B, 3, C, H * W)
+        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
 
-        # 计算注意力
-        attn = torch.einsum('bchw,bcHW->bhwHW', q, k) * (C ** -0.5)
-        attn = attn.flatten(3).softmax(dim=-1).view(B, H, W, H, W)
+        # Standard Dot-Product Attention
+        attn = torch.matmul(q.transpose(-1, -2), k) * (C ** -0.5)
+        attn = attn.softmax(dim=-1)
 
-        out = torch.einsum('bhwHW,bcHW->bchw', attn, v)
-        out = self.proj(out)
-
-        return residual + out
+        out = torch.matmul(v, attn.transpose(-1, -2))
+        out = out.view(B, C, H, W)
+        return residual + self.proj(out)
 
 
 class Down(nn.Module):
@@ -138,7 +164,7 @@ class Up(nn.Module):
 
 
 class UNet(nn.Module):
-    def __init__(self, n_channels=3, n_classes=3, time_emb_dim=128):
+    def __init__(self, n_channels=3, n_classes=3, time_emb_dim=256):
         super().__init__()
         self.n_channels = n_channels
         self.n_classes = n_classes
@@ -163,10 +189,11 @@ class UNet(nn.Module):
 
         # Bottleneck
         self.bottleneck = DoubleConv(512, 512, time_emb_dim)
+        self.bottleneck_attn = SelfAttention(512)
 
         # Upsampling - 注意每个Up的通道数设置
         self.up1 = Up(in_channels=512, skip_channels=512, out_channels=256,
-                      time_emb_dim=time_emb_dim)  # 512(bottleneck) + 512(skip) -> 256
+                      time_emb_dim=time_emb_dim, use_attention=True)  # 512(bottleneck) + 512(skip) -> 256
         self.up2 = Up(in_channels=256, skip_channels=256, out_channels=128,
                       time_emb_dim=time_emb_dim)  # 256 + 256 -> 128
         self.up3 = Up(in_channels=128, skip_channels=128, out_channels=64,
@@ -176,8 +203,8 @@ class UNet(nn.Module):
 
         # 输出层
         self.outc = nn.Sequential(
-            # nn.GroupNorm(min(8, 64), 64),
-            # nn.SiLU(),
+            nn.GroupNorm(min(8, 64), 64),
+            nn.SiLU(),
             nn.Conv2d(64, n_classes, kernel_size=1)
         )
 
@@ -194,6 +221,7 @@ class UNet(nn.Module):
 
         # Bottleneck
         x5 = self.bottleneck(x5, t)  # 512通道
+        x5 = self.bottleneck_attn(x5)
 
         # Decoder with skip connections
         x = self.up1(x5, x4, t)  # 输入: 512(bottleneck), 512(skip) -> 输出: 256
@@ -220,23 +248,29 @@ class TimestepEmbedder(nn.Module):
         return emb
 
 def load_model(model_path, in_channels=3, out_channels=3):
-    # 创建模型并加载权重
-    model = UNet(n_channels=in_channels, n_classes=out_channels, time_emb_dim=64)
+    model = UNet(n_channels=in_channels, n_classes=out_channels, time_emb_dim=512)
 
-    if os.path.exists(model_path):
-        if model_path.endswith('.pth'):
-            checkpoint = torch.load(model_path, map_location='cpu')
-            if 'model_state_dict' in checkpoint:
-                model.load_state_dict(checkpoint['model_state_dict'])
-                print(f"Loaded full model checkpoint from {model_path}")
-            else:
-                model.load_state_dict(checkpoint)
-                print(f"Loaded model weights from {model_path}")
-        else:
-            print(f"Model file {model_path} not found!")
-            return None
-    else:
+    if not os.path.exists(model_path):
         print(f"Model file {model_path} not found!")
-        return None
+        return None, None
 
-    return model
+    checkpoint = torch.load(model_path, map_location='cpu')
+
+    if 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print(f"Loaded model weights from {model_path}")
+
+        ema = EMA(model, decay=0.999)
+
+        if 'ema_state_dict' in checkpoint:
+            ema.shadow = checkpoint['ema_state_dict']
+            print("Loaded EMA weights")
+        else:
+            print("No EMA weights found")
+
+        return model, ema
+
+    else:
+        model.load_state_dict(checkpoint)
+        print(f"Loaded model weights (no EMA)")
+        return model, None

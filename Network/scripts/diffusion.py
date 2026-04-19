@@ -51,10 +51,15 @@ class NoiseScheduler:
         # Estimate x0 from xt and noise
         x0 = (xt - sqrt_one_minus_alphas_cumprod_t * noise) / sqrt_alphas_cumprod_t
         return x0
-
+    
     def get_snr(self, t):
         at = self.alphas_cumprod[t].view(-1, 1, 1, 1)
         return at/(1-at)
+
+    def get_velocity(self, x_0, noise, t):
+        at = self.alphas_cumprod[t].view(-1, 1, 1, 1)
+        v = torch.sqrt(at) * noise - torch.sqrt(1 - at) * x_0
+        return v
 
     # Forward diffusion process
     def forward_diffusion(self, x0, t):
@@ -117,24 +122,76 @@ class NoiseScheduler:
 
         return pre_noise, predicted
 
+#     @torch.no_grad()
+#     def ddim_sampling(self, model, x_0, y, steps=1000, eta=0.0):
+#         """
+#         DDIM采样，eta控制随机性
+#         eta=0: 确定性采样（更快，更平滑）
+#         eta=1: 完全随机（DDPM）
+#         """
+#         model.eval()
+#         x_t = torch.randn_like(x_0).to(self.device)
+
+#         # Use EMA if available
+#         sample_model = getattr(model, 'ema_model', model)
+
+#         for i in tqdm(reversed(range(0, steps)), desc='DDIM'):
+#             t = torch.full((x_t.shape[0],), i, device=self.device, dtype=torch.long)
+
+#             # 1. Predict Noise
+#             x_t_y = torch.cat((x_t, y), dim=1)
+#             pred_noise = sample_model(x_t_y, t)
+
+#             # 2. Get Alphas and reshape for 4D broadcasting
+#             at = self.alphas_cumprod[i].view(-1, 1, 1, 1)
+#             at_prev = (self.alphas_cumprod[i - 1] if i > 0 else torch.tensor(1.0)).view(-1, 1, 1, 1).to(self.device)
+
+#             # 3. Estimate x0 (The "predicted x0")
+#             # Formula: (x_t - sqrt(1 - alpha_t) * epsilon) / sqrt(alpha_t)
+#             sqrt_one_minus_at = torch.sqrt(1 - at)
+#             pred_x0 = (x_t - sqrt_one_minus_at * pred_noise) / torch.sqrt(at)
+#             # x_t = pred_x0
+#             # break
+#             # OPTIONAL: pred_x0 = torch.clamp(pred_x0, -2, 2)
+#             # Since you said clamping made it worse, keep it commented but watch it.
+
+#             if i > 0:
+#                 # 4. Calculate Sigma (randomness)
+#                 # sigma = eta * sqrt((1 - at_prev)/(1 - at) * (1 - at/at_prev))
+#                 sigma = eta * torch.sqrt((1 - at_prev) / (1 - at) * (1 - at / at_prev))
+
+#                 # 5. Direction pointing to x_t
+#                 # c2 is the weight for the noise (direction)
+#                 c2 = torch.sqrt(1 - at_prev - sigma ** 2)
+
+#                 random_noise = torch.randn_like(x_t) if eta > 0 else 0
+#                 x_t = torch.sqrt(at_prev) * pred_x0 + c2 * pred_noise + sigma * random_noise
+#                 # x_t = torch.clamp(x_t, -1.0, 1.0) # Use your [-2, 2] range
+#                 # break
+#             else:
+#                 x_t = pred_x0
+
+#             flag = True
+#             if i % 10 == 0 & flag:
+#                 # 写一个小接口，
+#                 output_dir = f'./output/t_sample_ddim_V5'
+#                 os.makedirs(output_dir, exist_ok=True)
+#                 pred_path = os.path.join(output_dir, f"x_{t.item()}.npy")
+#                 np.save(pred_path, x_t[0].detach().cpu().numpy())
+
+#         return pred_noise, x_t #torch.clamp(x_t, -1, 1)
+
     @torch.no_grad()
     def ddim_sampling(self, model, x_0, y, steps=1000, eta=0.0):
-        """
-        DDIM采样，eta控制随机性
-        eta=0: 确定性采样（更快，更平滑）
-        eta=1: 完全随机（DDPM）
-        """
         model.eval()
         x_t = torch.randn_like(x_0).to(self.device)
-        y_noise = torch.randn_like(y)
 
         for i in tqdm(reversed(range(0, steps)), desc='DDIM'):
             t = torch.full((x_t.shape[0],), i, device=self.device, dtype=torch.long)
 
             # 1. Predict Noise
-            y_t = self.add_noise(y, t, y_noise)
-            x_t_y = torch.cat((x_t, y_t), dim=1)
-            pred_noise = model(x_t_y, t)
+            x_t_y = torch.cat((x_t, y), dim=1)
+            pred_v = model(x_t_y, t)
 
             # 2. Get Alphas and reshape for 4D broadcasting
             at = self.alphas_cumprod[i].view(-1, 1, 1, 1)
@@ -143,7 +200,10 @@ class NoiseScheduler:
             # 3. Estimate x0 (The "predicted x0")
             # Formula: (x_t - sqrt(1 - alpha_t) * epsilon) / sqrt(alpha_t)
             sqrt_one_minus_at = torch.sqrt(1 - at)
-            pred_x0 = (x_t - sqrt_one_minus_at * pred_noise) / torch.sqrt(at)
+            sqrt_at = torch.sqrt(at)
+            # pred_x0 = (x_t - sqrt_one_minus_at * pred_noise) / torch.sqrt(at)
+            pred_x0 = sqrt_at * x_t - sqrt_one_minus_at * pred_v
+            pred_noise = sqrt_at * pred_v + sqrt_one_minus_at * x_t
             # x_t = pred_x0
             # break
             # OPTIONAL: pred_x0 = torch.clamp(pred_x0, -2, 2)
@@ -172,7 +232,8 @@ class NoiseScheduler:
                 pred_path = os.path.join(output_dir, f"x_{t.item()}.npy")
                 np.save(pred_path, x_t[0].detach().cpu().numpy())
 
-        return pred_noise, x_t #torch.clamp(x_t, -1, 1)
+        return pred_noise, x_t  # 只返回最终图像
+
 
     # # 使用不同的采样参数
     # # 方案A: 确定性采样（更快，可能更平滑）
@@ -180,8 +241,43 @@ class NoiseScheduler:
     #
     # # 方案B: 增加采样步数（质量更好，但更慢）
     # samples = ddim_sample(model, scheduler, noise, steps=200, eta=0.5)
+    @torch.no_grad()
+    def sample_cfg(self, model, y, steps=1000, cfg_scale=3.0):
+        """
+        cfg_scale: 1.0 is standard. 2.0-7.0 'pushes' the image to be cleaner.
+        """
+        model.eval()
+        batch_size = y.shape[0]
+        x_t = torch.randn((batch_size, 1, y.shape[2], y.shape[3]), device=self.device)
 
+        # Create a null condition (zeros) for the unconditional branch
+        y_null = torch.zeros_like(y)
 
+        for i in tqdm(reversed(range(0, steps)), desc='CFG Sampling'):
+            t = torch.full((batch_size,), i, device=self.device, dtype=torch.long)
+
+            # 1. Predict noise WITH condition
+            eps_cond = model(torch.cat([x_t, y], dim=1), t)
+
+            # 2. Predict noise WITHOUT condition
+            eps_uncond = model(torch.cat([x_t, y_null], dim=1), t)
+
+            # 3. Combine: The 'Guidance' formula
+            # This pushes the model away from 'generic' noise toward the specific signal
+            pred_noise = eps_uncond + cfg_scale * (eps_cond - eps_uncond)
+
+            # 4. Standard DDIM/DDPM step logic using 'pred_noise'
+            # (Use your existing alpha/sigma math here)
+            at = self.alphas_cumprod[i].view(-1, 1, 1, 1)
+            at_prev = (self.alphas_cumprod[i-1] if i > 0 else torch.tensor(1.0)).view(-1, 1, 1, 1).to(self.device)
+
+            pred_x0 = (x_t - torch.sqrt(1 - at) * pred_noise) / torch.sqrt(at)
+
+            # Using DDIM step for speed
+            c2 = torch.sqrt(1 - at_prev)
+            x_t = torch.sqrt(at_prev) * pred_x0 + c2 * pred_noise
+
+        return eps_uncond, x_t
 
 
 # # Example usage

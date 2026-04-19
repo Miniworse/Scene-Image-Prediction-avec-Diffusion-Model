@@ -72,6 +72,7 @@ class PredictDataset:
 
         # 归一化
         if self.normalize:
+
             # scene_tensor = torch.clamp(scene_tensor / 50.0 - 3.0, -3.0, 3.0)
             # observe_tensor = torch.clamp(observe_tensor / 50.0 - 3.0, -3.0, 3.0)
             # scene_tensor = t_normalize(scene_tensor)
@@ -103,6 +104,9 @@ def predict_and_save(model, ema, dataset, output_dir, device='cuda'):
         for scene, observe, index in tqdm(dataset, desc="Predicting"):
             scene = scene.unsqueeze(0).to(device)  # 添加batch维度
             observe = observe.unsqueeze(0).to(device)
+               
+            # observe = torch.zeros_like(observe)
+            
             if index == '0001':
                 flag = True
             else:
@@ -116,7 +120,11 @@ def predict_and_save(model, ema, dataset, output_dir, device='cuda'):
             # pre_noise, predicted  = noise_scheduler.sampling(model, x_t, observe)
             # pre_noise, predicted = noise_scheduler.native_sampling2(model, scene, observe, flag)
             # pre_noise, predicted = noise_scheduler.fast_sampling(model, scene, observe)
-            pre_noise, predicted = noise_scheduler.ddim_sampling(model, scene, observe, steps=1000, eta=1)
+
+            pre_noise, predicted = noise_scheduler.ddim_sampling(model, scene, observe, steps=1000, eta=0)
+
+            # predicted = model(torch.cat([observe, observe], dim=1), torch.zeros_like(torch.full((observe.shape[0],), 1, device=device, dtype=torch.long)))
+            # pre_noise = predicted
 
             if ema is not None:
                 ema.restore()

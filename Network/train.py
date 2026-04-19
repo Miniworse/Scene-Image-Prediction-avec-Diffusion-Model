@@ -86,6 +86,7 @@ class SceneObserveDataset(Dataset):
 
         # 数据归一化（可选）
         if self.normalize:
+
             # scene_tensor = torch.clamp(scene_tensor / 500.0, -1.0, 1.0)
             # observe_tensor = torch.clamp(observe_tensor / 500.0, -1.0, 1.0)
             # 在辐射计场景下的归一化操作？
@@ -145,9 +146,11 @@ def split_dataset(data_dir, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, se
 
 # 4. 训练函数
 def train_model(model, train_loader, val_loader, model_dir, log_dir, epochs=50, lr=0.001, device='cpu'):
-    ema = EMA(model, decay=0.999)
+    ema = EMA(model, decay=0.999, device=device)
     model = model.to(device)
     criterion = nn.MSELoss()  # 使用均方误差损失
+
+    # criterion = nn.L1Loss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda epoch: 1.0)
 
@@ -171,29 +174,34 @@ def train_model(model, train_loader, val_loader, model_dir, log_dir, epochs=50, 
         train_loss = 0.0
         for batch_idx, (scene_imgs, observe_imgs) in enumerate(train_loader):
             scene_imgs, observe_imgs = scene_imgs.to(device), observe_imgs.to(device)
-
+            
+    
             # Here add noise to the
             batch_size = len(scene_imgs)
             t = torch.randint(0, T, (batch_size,)).to(device)
-
-            # # Bias toward high noise to force the model to work harder on "blurry" images
+            # Bias toward high noise to force the model to work harder on "blurry" images
             # t = torch.pow(torch.rand((batch_size,)), 0.7) * 1000
             # t = t.long().to(device)
 
             xt, noise = noise_scheduler.forward_diffusion(scene_imgs, t)
-            observe_noisy = noise_scheduler.add_noise(observe_imgs, t, torch.randn_like(observe_imgs))
+
+            # observe_noisy = noise_scheduler.add_noise(observe_imgs, t, torch.randn_like(observe_imgs))
+            observe_noisy = observe_imgs
             xt_observe_cat = torch.cat([xt, observe_noisy], dim=1)
 
             # t_m = t.float() / noise_scheduler.T
             outputs = model(xt_observe_cat, t)
+            velocity = noise_scheduler.get_velocity(scene_imgs, noise, t)
 
             # snr = noise_scheduler.get_snr(t)
             # snr = snr.view(-1, 1, 1, 1)
             # weight = torch.clamp(snr, max=5.0)
             # weight = weight + 0.1
+            snr = noise_scheduler.get_snr(t).view(-1,1,1,1)
+            weight = snr / (snr + 1)
 
-            # loss = (weight * (outputs - noise) ** 2).mean()
-            loss = criterion(outputs, noise)
+            loss = (weight * (outputs - velocity) ** 2).mean()
+            # loss = criterion(outputs, velocity)
 
             # for i in [0, 100, 300, 600, 900]:
             #     t_test = torch.full((batch_size,), i, device=device)
@@ -211,8 +219,19 @@ def train_model(model, train_loader, val_loader, model_dir, log_dir, epochs=50, 
             # # print("snr:", snr[:5].flatten())
             # print("pred std:", outputs.std().item())
 
+            pre_x_0 = noise_scheduler.deblur(xt, t, noise)
+
+
+            # pred = model(torch.cat([observe_imgs, observe_imgs], dim=1), torch.zeros_like(t))
+            # loss = criterion(pred, scene_imgs)
+            # predicted_noise = pred
+            # xt = observe_imgs
+            # outputs = scene_imgs
+
             optimizer.zero_grad()
             loss.backward()
+            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
             optimizer.step()
             ema.update()
             train_loss += loss.item()
@@ -245,13 +264,16 @@ def train_model(model, train_loader, val_loader, model_dir, log_dir, epochs=50, 
         #     torch.save(model.state_dict(), './model/scene_to_observe_model.pth')
         #     print(f'New best model saved with validation loss: {best_val_loss:.6f}')
 
-        if epoch % 5 == 0:
+        if epoch % 10 == 0:
             best_val_loss = avg_train_loss
             best_model_state = model.state_dict().copy()
             torch.save(model.state_dict(), model_dir)
             print(f'New best model saved with validation loss: {best_val_loss:.6f}')
 
-            predicted_noise = noise_scheduler.deblur(xt[0], t[0].item(),outputs[0])
+            # predicted_noise = noise_scheduler.deblur(xt[0], t[0].item(),outputs[0])
+            # v-prediction
+            at = noise_scheduler.alphas_cumprod(t).view(-1,1,1,1)
+            predicted_noise = torch.sqrt(at) * xt - torch.sqrt(1 - at) * outputs
 
             scene_save = scene_imgs[0].cpu().detach().numpy()
             x_t_save = xt[0].cpu().detach().numpy()

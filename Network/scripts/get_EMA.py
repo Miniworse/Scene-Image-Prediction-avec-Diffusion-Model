@@ -1,7 +1,10 @@
 class EMA:
-    def __init__(self, model, decay=0.999):
+    def __init__(self, model, decay=0.999, device=None):
         self.decay = decay
         self.model = model
+        if device is None:
+            device = next(model.parameters()).device
+        self.device = device
         self.shadow = {}
         self.backup = {}
 
@@ -14,6 +17,8 @@ class EMA:
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 assert name in self.shadow
+                if self.shadow[name].device != param.data.device:
+                    self.shadow[name] = self.shadow[name].to(param.data.device)
                 new_avg = self.decay * self.shadow[name] + (1.0 - self.decay) * param.data
                 self.shadow[name] = new_avg.clone()
 
@@ -22,6 +27,8 @@ class EMA:
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 self.backup[name] = param.data.clone()
+                if self.shadow[name].device != param.data.device:
+                    self.shadow[name] = self.shadow[name].to(param.data.device)
                 param.data = self.shadow[name]
 
     def restore(self):

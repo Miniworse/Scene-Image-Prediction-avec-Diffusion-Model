@@ -13,9 +13,15 @@ try:
 
     Param = eng.Param4python()
 
-    source_dir = 'D:\Documents\Self_Files\Projects\SceneGenerating2\output_smos_simulation_test\\npy_files'
-    output_dir = 'D:\Documents\Self_Files\Projects\SceneGenerating2\output_smos_simulation_test\\npy_files'
+    source_dir = 'D:\Documents\Self_Files\Projects\SceneGenerating2\output_coastline_patches\\npy_files'
+    source_dir = 'D:\Documents\Self_Files\Projects\SceneGenerating\data\data17Mars\Binary'
+    output_dir = 'data\\data30Avr'
     os.makedirs(output_dir, exist_ok=True)
+
+    train_dir = os.path.join(output_dir, 'train')
+    test_dir = os.path.join(output_dir, 'test')
+    os.makedirs(train_dir, exist_ok=True)
+    os.makedirs(test_dir, exist_ok=True)
 
     npy_files = [f for f in os.listdir(source_dir) if f.endswith('.npy')]
 
@@ -29,24 +35,39 @@ try:
 
     npy_files.sort(key=extract_number)
 
-    for i, filename in enumerate(npy_files, 1):
-        print(f"\r处理第 {i}/{len(npy_files)} 个文件: {filename}", end="")
+    # 设置划分比例
+    train_ratio = 0.95  # 80% 训练集，20% 测试集
+
+    # 使用 numpy 随机划分
+    np.random.seed(42)  # 设置随机种子，确保结果可重复
+    indices = np.random.permutation(len(npy_files))
+    train_size = int(len(npy_files) * train_ratio)
+    train_indices = indices[:train_size]
+    test_indices = indices[train_size:]
+
+    train_files = [npy_files[i] for i in train_indices]
+    test_files = [npy_files[i] for i in test_indices]
+
+    print("处理训练集...")
+    for i, filename in enumerate(train_files, 1):
+        print(f"\r处理第 {i}/{len(train_files)} 个文件: {filename}", end="")
 
         # 读取原始数据
         filepath = os.path.join(source_dir, filename)
         original_data = np.load(filepath)
 
         # 乘以90
-        scene_TB = original_data
+        scene_TB = original_data * 90
         scene_TB = np.array(scene_TB, dtype=np.double)
 
-        _, observe_TB = eng.TB4python(Param, scene_TB, nargout=2)
+        _, observe_TB = eng.TB4python_V2(Param, scene_TB, nargout=2)
         observe_TB = np.array(observe_TB, dtype=np.double)
         # res = np.array(res, dtype=np.complex128)
         # R = np.array(R, dtype=np.complex128)
 
         # 提取序号（保持4位数字）
         try:
+            raise Exception("手动触发异常，跳转到 except")
             # 从scene_XXXX.npy中提取XXXX
             num_str = filename.split('_')[1].split('.')[0]
             # 生成新文件名：observe_XXXX.npy
@@ -59,13 +80,48 @@ try:
             observe_filename = f"observe_{i:04d}.npy"
             observe_fig = f"observe_{i:04d}.png"
 
-        save_comparison_png(scene_TB, observe_TB, output_path=os.path.join(output_dir, observe_fig))
+        save_comparison_png(scene_TB, observe_TB, output_path=os.path.join(train_dir, observe_fig))
         # 保存处理后的数据
-        scene_output_path = os.path.join(output_dir, scene_filename)
-        observe_output_path = os.path.join(output_dir, observe_filename)
+        scene_output_path = os.path.join(train_dir, scene_filename)
+        observe_output_path = os.path.join(train_dir, observe_filename)
         np.save(scene_output_path, scene_TB)
         np.save(observe_output_path, observe_TB)
 
+    print("\n")
+
+    # 处理测试集
+    print("处理测试集...")
+    for i, filename in enumerate(test_files, 1):
+        print(f"\r处理测试集第 {i}/{len(test_files)} 个文件: {filename}", end="")
+
+        # 读取原始数据
+        filepath = os.path.join(source_dir, filename)
+        original_data = np.load(filepath)
+
+        scene_TB = original_data
+        scene_TB = np.array(scene_TB, dtype=np.double)
+
+        _, observe_TB = eng.TB4python_V2(Param, scene_TB, nargout=2)
+        observe_TB = np.array(observe_TB, dtype=np.double)
+
+        try:
+            raise Exception("手动触发异常，跳转到 except")
+            num_str = filename.split('_')[1].split('.')[0]
+            scene_filename = f"scene_{num_str}.npy"
+            observe_filename = f"observe_{num_str}.npy"
+            observe_fig = f"observe_{num_str}.png"
+        except:
+            scene_filename = f"scene_{i:04d}.npy"
+            observe_filename = f"observe_{i:04d}.npy"
+            observe_fig = f"observe_{i:04d}.png"
+
+        save_comparison_png(scene_TB, observe_TB, output_path=os.path.join(test_dir, observe_fig))
+        scene_output_path = os.path.join(test_dir, scene_filename)
+        observe_output_path = os.path.join(test_dir, observe_filename)
+        np.save(scene_output_path, scene_TB)
+        np.save(observe_output_path, observe_TB)
+
+    print("\n")
 
     # 关闭 MATLAB 引擎
     eng.quit()

@@ -376,6 +376,10 @@ class Up(nn.Module):
         """
         super().__init__()
         # 上采样层：将in_channels减半（ConvTranspose2d的out_channels = in_channels // 2）
+        # self.up = nn.Sequential(
+        #     nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+        #     nn.Conv2d(in_channels, in_channels // 2, kernel_size=3, padding=1)
+        # )
         self.up = nn.ConvTranspose2d(in_channels, in_channels // 2, kernel_size=2, stride=2)
 
         # 拼接后的通道数 = 上采样后的通道数 + 跳跃连接通道数
@@ -526,3 +530,74 @@ def load_model(model_path, in_channels=3, out_channels=3):
         model.load_state_dict(checkpoint)
         print(f"Loaded model weights (no EMA)")
         return model, None
+    
+    
+# 保存模型（改进版）
+def save_model(model, ema, model_path, epoch=None, optimizer=None, best_val_loss=None):
+    """
+    保存模型检查点
+
+    Args:
+        model: 模型
+        ema: EMA对象
+        model_path: 保存路径（完整文件路径）
+        epoch: 当前epoch（可选）
+        optimizer: 优化器（可选）
+        best_val_loss: 最佳验证损失（可选）
+    """
+    save_dict = {
+        'model_state_dict': model.state_dict(),
+        'ema_state_dict': ema.shadow if hasattr(ema, 'shadow') else ema.state_dict()
+    }
+
+    # 可选信息（用于恢复训练）
+    if epoch is not None:
+        save_dict['epoch'] = epoch
+    if optimizer is not None:
+        save_dict['optimizer_state_dict'] = optimizer.state_dict()
+    if best_val_loss is not None:
+        save_dict['best_val_loss'] = best_val_loss
+
+    torch.save(save_dict, model_path)
+    print(f'Model saved to {model_path}')
+
+
+def load_pretrained_model(model, ema, model_path, device='cpu', load_optimizer=False, optimizer=None):
+    """
+    加载模型检查点
+
+    Returns:
+        model: 加载后的模型
+        ema: 加载后的EMA
+        epoch: 保存时的epoch（如果有）
+        best_val_loss: 保存时的最佳验证损失（如果有）
+    """
+    checkpoint = torch.load(model_path, map_location=device)
+
+    # 加载模型权重
+    model.load_state_dict(checkpoint['model_state_dict'])
+
+    # 加载EMA权重
+    if 'ema_state_dict' in checkpoint:
+        if hasattr(ema, 'shadow'):
+            ema.shadow = checkpoint['ema_state_dict']
+        else:
+            ema.load_state_dict(checkpoint['ema_state_dict'])
+
+    # 获取训练信息
+    epoch = checkpoint.get('epoch', None)
+    best_val_loss = checkpoint.get('best_val_loss', None)
+
+    # 加载优化器（可选）
+    if load_optimizer and optimizer is not None and 'optimizer_state_dict' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        print("Optimizer state loaded")
+
+    print(f'Model loaded from {model_path}')
+    if epoch is not None:
+        print(f'Saved at epoch: {epoch}')
+    if best_val_loss is not None:
+        print(f'Best val loss: {best_val_loss:.6f}')
+
+    return model, ema, epoch, best_val_loss
+

@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 import os
 import matplotlib.pyplot as plt
@@ -15,7 +16,7 @@ from datetime import datetime
 from argparse import ArgumentParser
 from scripts.params import params_all
 from scripts.utils import *
-from scripts.Unet_model import UNet
+from scripts.Unet_model import UNet, load_pretrained_model, save_model
 
 import scripts.diffusion as diffusion
 from  scripts.cal_loss import compute_loss
@@ -145,7 +146,10 @@ def split_dataset(data_dir, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, se
 
 
 # 4. 训练函数
-def train_model(model, train_loader, val_loader, model_dir, log_dir, epochs=50, lr=0.001, device='cpu'):
+def train_model(model, train_loader, val_loader, model_dir, log_dir, epochs=50, lr=0.001, load_pretrained=False, device='cpu'):
+
+    writer = SummaryWriter(log_dir=log_dir)
+
     ema = EMA(model, decay=0.999, device=device)
     model = model.to(device)
     criterion = nn.MSELoss()  # 使用均方误差损失
@@ -156,6 +160,7 @@ def train_model(model, train_loader, val_loader, model_dir, log_dir, epochs=50, 
 
     # scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5)
 
+    start_epoch = 0
     train_losses = []
     val_losses = []
     pre_std = []
@@ -164,18 +169,27 @@ def train_model(model, train_loader, val_loader, model_dir, log_dir, epochs=50, 
     best_val_loss = float('inf')
     best_model_state = None
 
+    if load_pretrained:
+        model, ema, start_epoch, best_val_loss = load_pretrained_model(
+            model, ema, model_dir, device,
+            load_optimizer=True, optimizer=optimizer  # 传入已创建的optimizer
+        )
+        # 注意：如果保存的epoch是50，通常要从51开始训练
+        if start_epoch >= 0:
+            start_epoch = start_epoch
+            print(f"Resuming training from epoch {start_epoch + 1}")
+
     T = 1000  # Total timesteps
     betas = diffusion.get_beta_schedule(T, schedule_type='sqrt')
     noise_scheduler = diffusion.NoiseScheduler(betas, device=device)
 
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         # 训练阶段
         model.train()
         train_loss = 0.0
         for batch_idx, (scene_imgs, observe_imgs) in enumerate(train_loader):
             scene_imgs, observe_imgs = scene_imgs.to(device), observe_imgs.to(device)
-            
-    
+
             # Here add noise to the
             batch_size = len(scene_imgs)
             t = torch.randint(0, T, (batch_size,)).to(device)
@@ -241,6 +255,8 @@ def train_model(model, train_loader, val_loader, model_dir, log_dir, epochs=50, 
 
         avg_train_loss = train_loss / len(train_loader)
         train_losses.append(avg_train_loss)
+        writer.add_scalar('Loss/train', avg_train_loss, epoch)
+        writer.add_scalar('Learning_rate', optimizer.param_groups[0]['lr'], epoch)
         # pre_std.append(outputs.std().item())
         # t_index.append(t)
 
@@ -266,14 +282,12 @@ def train_model(model, train_loader, val_loader, model_dir, log_dir, epochs=50, 
 
         if epoch % 10 == 0:
             best_val_loss = avg_train_loss
-            best_model_state = model.state_dict().copy()
-            torch.save(model.state_dict(), model_dir)
-            print(f'New best model saved with validation loss: {best_val_loss:.6f}')
+            save_model(model, ema, model_dir, epoch=epoch, optimizer=optimizer, best_val_loss=best_val_loss)
 
             # predicted_noise = noise_scheduler.deblur(xt[0], t[0].item(),outputs[0])
             # v-prediction
-            at = noise_scheduler.alphas_cumprod(t).view(-1,1,1,1)
-            predicted_noise = torch.sqrt(at) * xt - torch.sqrt(1 - at) * outputs
+            at = noise_scheduler.alphas_cumprod[t].view(-1, 1, 1, 1)
+            predicted_noise = torch.sqrt(at[0]) * xt[0] - torch.sqrt(1 - at[0]) * outputs[0]
 
             scene_save = scene_imgs[0].cpu().detach().numpy()
             x_t_save = xt[0].cpu().detach().numpy()
@@ -291,6 +305,7 @@ def train_model(model, train_loader, val_loader, model_dir, log_dir, epochs=50, 
             f'Epoch: {epoch + 1}/{epochs} | Train Loss: {avg_train_loss:.6f}  | LR: {optimizer.param_groups[0]["lr"]:.6f}')
         print('-' * 60)
 
+    writer.close()
     # 加载最佳模型
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
@@ -334,7 +349,7 @@ def train_model(model, train_loader, val_loader, model_dir, log_dir, epochs=50, 
     # plt.savefig(os.path.join(log_dir, 'prestd_curve.png'), dpi=300, bbox_inches='tight')
     # plt.show()
 
-    return model, ema
+    return model, ema, optimizer
 
 
 # 5. 测试和可视化函数
@@ -498,6 +513,7 @@ def main(args):
     epochs = params.epochs
     learning_rate = params.learning_rate
     log_dir = params.log_dir
+    load_pretrained = params.load_pretrained
 
     print(f"\nStarting training...")
     print(f"Epochs: {epochs}")
@@ -507,9 +523,12 @@ def main(args):
     model_name = datetime.now().strftime("%b%d-%H%M%S")
     model_dir = os.path.join('./model', model_name + '.pth')
 
+    if load_pretrained:
+        model_dir = params.model_dir
+
     log_dir = os.path.join(log_dir, model_name)
 
-    model, ema = train_model(
+    model, ema, optimizer = train_model(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
@@ -517,6 +536,7 @@ def main(args):
         log_dir=log_dir,
         epochs=epochs,
         lr=learning_rate,
+        load_pretrained=load_pretrained,
         device=str(device)
     )
 
@@ -526,11 +546,7 @@ def main(args):
     # print(f'Test loss: {test_loss: .6f} \n')
 
     # 保存模型
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'ema_state_dict': ema.shadow
-    }, model_dir)
-    print('Model weights saved to {}'.format(model_name))
+    save_model(model, ema, model_dir, epoch=epochs, optimizer=optimizer, best_val_loss=None)
 
     # # 保存完整模型（包括架构）
     # torch.save({

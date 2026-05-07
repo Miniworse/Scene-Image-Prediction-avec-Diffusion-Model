@@ -1,6 +1,5 @@
 import glob
 import os
-from datetime import datetime
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -14,6 +13,8 @@ import scripts.diffusion as diffusion
 from scripts.Unet_model import ConditionalUNet, load_pretrained_model, save_model
 from scripts.get_EMA import EMA
 from scripts.params import params_all
+from scripts.run_layout import create_run_layout, find_latest_checkpoint, make_run_name, resolve_run_layout_for_model
+from scripts.run_summary import write_summary_files
 
 
 def prepare_image_tensor(data):
@@ -70,7 +71,7 @@ class SceneObserveDataset(Dataset):
         if indices is not None:
             self.valid_pairs = [self.valid_pairs[i] for i in indices if i < len(self.valid_pairs)]
 
-        print(f"Found {len(self.valid_pairs)} valid scene/ifft/visibility samples")
+        print(f"Found {len(self.valid_pairs)} valid scene/ifft/visibility samples in {data_dir}")
 
     def __len__(self):
         return len(self.valid_pairs)
@@ -132,120 +133,298 @@ def move_batch_to_device(batch, device):
     }
 
 
-def train_model(model, train_loader, model_dir, log_dir, epochs=50, lr=1e-3, load_pretrained=False, device="cpu"):
-    writer = SummaryWriter(log_dir=log_dir)
+def build_noise_scheduler(device):
+    betas = diffusion.get_beta_schedule(1000, schedule_type="sqrt")
+    return diffusion.NoiseScheduler(betas, device=device)
+
+
+def compute_diffusion_loss(model, noise_scheduler, batch, device):
+    batch = move_batch_to_device(batch, device)
+    scene_imgs = batch["scene"]
+    ifft_imgs = batch["ifft"]
+    visibility_imgs = batch["visibility"]
+    array_info = batch["array"]
+
+    batch_size = scene_imgs.shape[0]
+    t = torch.randint(0, 1000, (batch_size,), device=device)
+    xt, noise = noise_scheduler.forward_diffusion(scene_imgs, t)
+
+    outputs = model(
+        xt,
+        t,
+        ifft_cond=ifft_imgs,
+        visibility=visibility_imgs,
+        antenna_xy=array_info,
+    )
+
+    velocity = noise_scheduler.get_velocity(scene_imgs, noise, t)
+    snr = noise_scheduler.get_snr(t).view(-1, 1, 1, 1)
+    weight = snr / (snr + 1)
+    loss = (weight * (outputs - velocity) ** 2).mean()
+
+    context = {
+        "scene": scene_imgs,
+        "ifft": ifft_imgs,
+        "visibility": visibility_imgs,
+        "array": array_info,
+        "xt": xt,
+        "outputs": outputs,
+        "timestep": t,
+        "sample_id": batch["id"][0],
+    }
+    return loss, context
+
+
+def evaluate_validation(model, val_loader, noise_scheduler, device):
+    if val_loader is None or len(val_loader) == 0:
+        return None
+
+    model.eval()
+    losses = []
+    with torch.no_grad():
+        for batch in val_loader:
+            loss, _ = compute_diffusion_loss(model, noise_scheduler, batch, device)
+            losses.append(loss.item())
+    model.train()
+    return float(np.mean(losses)) if losses else None
+
+
+def save_training_snapshot(context, noise_scheduler, target_dir, epoch):
+    timestep = context["timestep"]
+    at = noise_scheduler.alphas_cumprod[timestep].view(-1, 1, 1, 1)
+    predicted_noise = torch.sqrt(at[0]) * context["xt"][0] - torch.sqrt(1 - at[0]) * context["outputs"][0]
+    np.savez(
+        os.path.join(target_dir, f"train_{epoch}.npz"),
+        sample_id=np.array(context["sample_id"]),
+        scene=context["scene"][0].detach().cpu().numpy(),
+        ifft=context["ifft"][0].detach().cpu().numpy(),
+        visibility=context["visibility"][0].detach().cpu().numpy(),
+        outputs=context["outputs"][0].detach().cpu().numpy(),
+        predicted=predicted_noise.detach().cpu().numpy(),
+        xt=context["xt"][0].detach().cpu().numpy(),
+        timestep=timestep[0].item(),
+    )
+
+
+def save_training_curve(train_losses, val_losses, output_path):
+    plt.figure(figsize=(10, 5))
+    plt.plot(train_losses, label="Train Loss")
+    valid_val_points = [loss for loss in val_losses if loss is not None]
+    if valid_val_points:
+        x = [idx for idx, loss in enumerate(val_losses) if loss is not None]
+        y = [loss for loss in val_losses if loss is not None]
+        plt.plot(x, y, label="Validation Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.legend()
+    plt.title("Training and Validation Loss")
+    plt.grid(True)
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+def get_params_snapshot(params):
+    return {key: value for key, value in params.items()}
+
+
+def build_train_summary(
+    run_layout,
+    checkpoint_paths,
+    data_dir,
+    array_path,
+    dataset_sizes,
+    sample_shapes,
+    params,
+    model,
+    train_losses,
+    val_losses,
+    avg_test_loss,
+    best_epoch,
+    best_val_loss,
+):
+    return {
+        "title": f"Training Summary - {run_layout['run_name']}",
+        "run_name": run_layout["run_name"],
+        "run_dir": run_layout["run_dir"],
+        "checkpoint_paths": checkpoint_paths,
+        "data_dir": data_dir,
+        "array_path": array_path,
+        "dataset_sizes": dataset_sizes,
+        "sample_shapes": sample_shapes,
+        "model_config": {
+            "architecture": model.__class__.__name__,
+            "n_channels": getattr(model, "n_channels", None),
+            "n_classes": getattr(model, "n_classes", None),
+            "time_emb_dim": getattr(model, "time_emb_dim", None),
+            "parameter_count": int(sum(p.numel() for p in model.parameters())),
+        },
+        "training_objective": {
+            "diffusion_timesteps": 1000,
+            "beta_schedule": "sqrt",
+            "prediction_target": "velocity",
+            "loss": "weighted_mse",
+            "weight_formula": "snr / (snr + 1)",
+            "optimizer": "Adam",
+            "scheduler": "ReduceLROnPlateau",
+            "ema_decay": 0.999,
+        },
+        "sampling_for_test_visualization": {
+            "sampler": "ddim",
+            "steps": 250,
+            "eta": 0,
+            "criterion": "MSE(predicted_scene, target_scene)",
+        },
+        "params": get_params_snapshot(params),
+        "results": {
+            "train_loss_first": float(train_losses[0]) if train_losses else None,
+            "train_loss_last": float(train_losses[-1]) if train_losses else None,
+            "train_loss_min": float(min(train_losses)) if train_losses else None,
+            "train_loss_curve": [float(loss) for loss in train_losses],
+            "val_loss_last": float(val_losses[-1]) if val_losses and val_losses[-1] is not None else None,
+            "val_loss_min": float(min(loss for loss in val_losses if loss is not None)) if any(loss is not None for loss in val_losses) else None,
+            "val_loss_curve": [float(loss) if loss is not None else None for loss in val_losses],
+            "best_epoch": best_epoch,
+            "best_val_loss": float(best_val_loss) if best_val_loss is not None else None,
+            "test_loss": float(avg_test_loss) if avg_test_loss is not None else None,
+        },
+    }
+
+
+def train_model(
+    model,
+    train_loader,
+    val_loader,
+    run_layout,
+    params,
+    resume_checkpoint_path=None,
+    device="cpu",
+):
+    writer = SummaryWriter(log_dir=os.path.join(run_layout["run_dir"], "tensorboard"))
     ema = EMA(model, decay=0.999, device=device)
     model = model.to(device)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0)
+    optimizer = optim.Adam(model.parameters(), lr=params.learning_rate)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=10)
 
     start_epoch = 0
     train_losses = []
-    best_val_loss = float("inf")
+    val_losses = []
+    best_val_loss = None
+    best_epoch = None
 
-    if load_pretrained:
+    if params.load_pretrained and resume_checkpoint_path:
         model, ema, start_epoch, best_val_loss = load_pretrained_model(
             model,
             ema,
-            model_dir,
+            resume_checkpoint_path,
             device,
             load_optimizer=True,
             optimizer=optimizer,
         )
         if start_epoch is None:
             start_epoch = 0
+        else:
+            start_epoch += 1
         print(f"Resuming training from epoch {start_epoch + 1}")
 
-    timesteps = 1000
-    betas = diffusion.get_beta_schedule(timesteps, schedule_type="sqrt")
-    noise_scheduler = diffusion.NoiseScheduler(betas, device=device)
+    noise_scheduler = build_noise_scheduler(device)
+    latest_checkpoint_path = run_layout["latest_checkpoint"]
+    best_checkpoint_path = run_layout["best_checkpoint"]
 
-    for epoch in range(start_epoch, epochs):
+    for epoch in range(start_epoch, params.epochs):
         model.train()
         epoch_loss = 0.0
+        last_context = None
 
         for batch_idx, batch in enumerate(train_loader):
-            batch = move_batch_to_device(batch, device)
-            scene_imgs = batch["scene"]
-            ifft_imgs = batch["ifft"]
-            visibility_imgs = batch["visibility"]
-            array_info = batch["array"]
-
-            batch_size = scene_imgs.shape[0]
-            sample_id = batch["id"][0]
-            t = torch.randint(0, timesteps, (batch_size,), device=device)
-            xt, noise = noise_scheduler.forward_diffusion(scene_imgs, t)
-
-            outputs = model(
-                xt,
-                t,
-                ifft_cond=ifft_imgs,
-                visibility=visibility_imgs,
-                antenna_xy=array_info,
-            )
-
-            velocity = noise_scheduler.get_velocity(scene_imgs, noise, t)
-            snr = noise_scheduler.get_snr(t).view(-1, 1, 1, 1)
-            weight = snr / (snr + 1)
-            loss = (weight * (outputs - velocity) ** 2).mean()
-
+            loss, context = compute_diffusion_loss(model, noise_scheduler, batch, device)
             optimizer.zero_grad()
             loss.backward()
+            if params.max_grad_norm is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), params.max_grad_norm)
             optimizer.step()
             ema.update()
 
             epoch_loss += loss.item()
+            last_context = context
             if batch_idx % 10 == 0:
-                print(f"Epoch: {epoch + 1}/{epochs} | Batch: {batch_idx}/{len(train_loader)} | Loss: {loss.item():.6f}")
+                print(
+                    f"Epoch: {epoch + 1}/{params.epochs} | "
+                    f"Batch: {batch_idx}/{len(train_loader)} | Loss: {loss.item():.6f}"
+                )
 
         avg_train_loss = epoch_loss / max(len(train_loader), 1)
+        val_loss = evaluate_validation(model, val_loader, noise_scheduler, device)
+        scheduler_metric = val_loss if val_loss is not None else avg_train_loss
+        scheduler.step(scheduler_metric)
+
         train_losses.append(avg_train_loss)
+        val_losses.append(val_loss)
         writer.add_scalar("Loss/train", avg_train_loss, epoch)
+        if val_loss is not None:
+            writer.add_scalar("Loss/validation", val_loss, epoch)
         writer.add_scalar("Learning_rate", optimizer.param_groups[0]["lr"], epoch)
 
-        if epoch % 10 == 0:
-            best_val_loss = avg_train_loss
-            save_model(model, ema, model_dir, epoch=epoch, optimizer=optimizer, best_val_loss=best_val_loss)
+        save_model(
+            model,
+            ema,
+            latest_checkpoint_path,
+            epoch=epoch,
+            optimizer=optimizer,
+            best_val_loss=best_val_loss,
+        )
 
-            at = noise_scheduler.alphas_cumprod[t].view(-1, 1, 1, 1)
-            predicted_noise = torch.sqrt(at[0]) * xt[0] - torch.sqrt(1 - at[0]) * outputs[0]
-            np.savez(
-                os.path.join(log_dir, f"train_{epoch}.npz"),
-                sample_id=np.array(sample_id),
-                scene=scene_imgs[0].detach().cpu().numpy(),
-                ifft=ifft_imgs[0].detach().cpu().numpy(),
-                visibility=visibility_imgs[0].detach().cpu().numpy(),
-                outputs=outputs[0].detach().cpu().numpy(),
-                predicted=predicted_noise.detach().cpu().numpy(),
-                xt=xt[0].detach().cpu().numpy(),
-                timestep=t[0].item(),
+        if val_loss is not None and (best_val_loss is None or val_loss < best_val_loss):
+            best_val_loss = val_loss
+            best_epoch = epoch + 1
+            save_model(
+                model,
+                ema,
+                best_checkpoint_path,
+                epoch=epoch,
+                optimizer=optimizer,
+                best_val_loss=best_val_loss,
             )
+            print(f"Best checkpoint updated at epoch {epoch + 1} with val loss {best_val_loss:.6f}")
 
-        scheduler.step(avg_train_loss)
-        print(f"Epoch: {epoch + 1}/{epochs} | Train Loss: {avg_train_loss:.6f} | LR: {optimizer.param_groups[0]['lr']:.6f}")
+        if params.checkpoint_every and (epoch + 1) % params.checkpoint_every == 0:
+            epoch_checkpoint_path = os.path.join(
+                run_layout["checkpoints_dir"],
+                f"epoch_{epoch + 1:04d}.pth",
+            )
+            save_model(
+                model,
+                ema,
+                epoch_checkpoint_path,
+                epoch=epoch,
+                optimizer=optimizer,
+                best_val_loss=best_val_loss,
+            )
+            if last_context is not None:
+                save_training_snapshot(last_context, noise_scheduler, run_layout["train_dir"], epoch + 1)
+
+        val_loss_display = f"{val_loss:.6f}" if val_loss is not None else "N/A"
+        print(
+            f"Epoch: {epoch + 1}/{params.epochs} | "
+            f"Train Loss: {avg_train_loss:.6f} | Val Loss: {val_loss_display} | "
+            f"LR: {optimizer.param_groups[0]['lr']:.6f}"
+        )
         print("-" * 60)
 
     writer.close()
+    save_training_curve(train_losses, val_losses, os.path.join(run_layout["train_dir"], "training_curve.png"))
 
-    plt.figure(figsize=(10, 5))
-    plt.plot(train_losses, label="Train Loss")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.legend()
-    plt.title("Training Loss")
-    plt.grid(True)
-    plt.savefig(os.path.join(log_dir, "training_curve.png"), dpi=300, bbox_inches="tight")
-    plt.close()
-
-    return model, ema, optimizer
+    checkpoint_paths = {
+        "latest": latest_checkpoint_path,
+        "best": best_checkpoint_path if os.path.exists(best_checkpoint_path) else None,
+    }
+    return model, ema, optimizer, train_losses, val_losses, best_epoch, best_val_loss, checkpoint_paths
 
 
-def test_and_visualize(model, ema, test_loader, log_dir, device="cuda"):
+def test_and_visualize(model, ema, test_loader, output_dir, device="cuda"):
     model.eval()
     criterion = torch.nn.MSELoss()
     test_loss = 0.0
-    betas = diffusion.get_beta_schedule(1000, schedule_type="sqrt")
-    noise_scheduler = diffusion.NoiseScheduler(betas, device)
+    noise_scheduler = build_noise_scheduler(device)
 
     with torch.no_grad():
         for index, batch in enumerate(test_loader):
@@ -256,17 +435,24 @@ def test_and_visualize(model, ema, test_loader, log_dir, device="cuda"):
             array_info = batch["array"]
             sample_id = batch["id"][0]
 
+            if ema is not None:
+                ema.apply_shadow()
+
             condition = {
                 "ifft_cond": ifft_imgs,
                 "visibility": visibility_imgs,
                 "antenna_xy": array_info,
             }
-            pre_noise, predicted = noise_scheduler.ddim_sampling(model, scene_imgs, condition, steps=250, eta=0)
+            pre_noise, predicted = noise_scheduler.ddim_sampling(model, scene_imgs, condition, steps=1000, eta=0)
+
+            if ema is not None:
+                ema.restore()
+
             loss = criterion(predicted, scene_imgs)
             test_loss += loss.item()
 
             np.savez(
-                os.path.join(log_dir, f"tested_{index}.npz"),
+                os.path.join(output_dir, f"tested_{index}.npz"),
                 sample_id=np.array(sample_id),
                 outputs=predicted[0].detach().cpu().numpy(),
                 observe=ifft_imgs[0].detach().cpu().numpy(),
@@ -303,12 +489,24 @@ def main(args):
     val_dataset = SceneObserveDataset(data_dir, val_indices, normalize=True)
     test_dataset = SceneObserveDataset(data_dir, test_indices, normalize=True)
 
+    dataset_sizes = {
+        "train": len(train_dataset),
+        "validation": len(val_dataset),
+        "test": len(test_dataset),
+    }
     print("\nDataset sizes:")
-    print(f"Training set: {len(train_dataset)} samples")
-    print(f"Validation set: {len(val_dataset)} samples")
-    print(f"Test set: {len(test_dataset)} samples")
+    print(f"Training set: {dataset_sizes['train']} samples")
+    print(f"Validation set: {dataset_sizes['validation']} samples")
+    print(f"Test set: {dataset_sizes['test']} samples")
 
     sample = train_dataset[0]
+    array_path = train_dataset.array_path
+    sample_shapes = {
+        "scene": list(sample["scene"].shape),
+        "ifft": list(sample["ifft"].shape),
+        "visibility": list(sample["visibility"].shape),
+        "array": list(sample["array"].shape),
+    }
     print(
         f"\nSample shapes - Scene: {sample['scene'].shape}, "
         f"IFFT: {sample['ifft'].shape}, Visibility: {sample['visibility'].shape}, Array: {sample['array'].shape}"
@@ -332,33 +530,73 @@ def main(args):
         visibility_channels=visibility_channels,
     )
 
+    resume_candidate = params.model_dir
+    if params.load_pretrained and not os.path.exists(resume_candidate):
+        fallback_model = find_latest_checkpoint(params.runs_dir, checkpoint_name="latest.pth")
+        if fallback_model is not None:
+            print(f"Configured resume checkpoint not found. Falling back to: {fallback_model}")
+            resume_candidate = fallback_model
+
+    if params.load_pretrained and os.path.exists(resume_candidate):
+        run_layout = resolve_run_layout_for_model(resume_candidate, params.runs_dir)
+        resume_checkpoint_path = resume_candidate
+    else:
+        run_layout = create_run_layout(params.runs_dir, make_run_name())
+        resume_checkpoint_path = None
+
     print("\nModel architecture:")
     print(model)
     print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"Run directory: {run_layout['run_dir']}")
+    print(f"Latest checkpoint path: {run_layout['latest_checkpoint']}")
+    print(f"Best checkpoint path: {run_layout['best_checkpoint']}")
 
-    model_name = datetime.now().strftime("%b%d-%H%M%S")
-    model_dir = os.path.join("./model", model_name + ".pth")
-    if params.load_pretrained:
-        model_dir = params.model_dir
-    log_dir = os.path.join(params.log_dir, model_name)
-    os.makedirs(log_dir, exist_ok=True)
-    print(f"Checkpoint path: {model_dir}")
-    print(f"Log directory: {log_dir}")
-
-    model, ema, optimizer = train_model(
+    model, ema, optimizer, train_losses, val_losses, best_epoch, best_val_loss, checkpoint_paths = train_model(
         model=model,
         train_loader=train_loader,
-        model_dir=model_dir,
-        log_dir=log_dir,
-        epochs=params.epochs,
-        lr=params.learning_rate,
-        load_pretrained=params.load_pretrained,
+        val_loader=val_loader,
+        run_layout=run_layout,
+        params=params,
+        resume_checkpoint_path=resume_checkpoint_path,
         device=str(device),
     )
 
     print("\nTesting model...")
-    test_and_visualize(model, ema, test_loader, log_dir, device)
-    save_model(model, ema, model_dir, epoch=params.epochs, optimizer=optimizer, best_val_loss=None)
+    avg_test_loss = test_and_visualize(model, ema, test_loader, run_layout["test_dir"], device)
+
+    if not os.path.exists(checkpoint_paths["best"] or ""):
+        save_model(
+            model,
+            ema,
+            run_layout["best_checkpoint"],
+            epoch=params.epochs - 1,
+            optimizer=optimizer,
+            best_val_loss=best_val_loss,
+        )
+        checkpoint_paths["best"] = run_layout["best_checkpoint"]
+
+    train_summary = build_train_summary(
+        run_layout=run_layout,
+        checkpoint_paths=checkpoint_paths,
+        data_dir=data_dir,
+        array_path=array_path,
+        dataset_sizes=dataset_sizes,
+        sample_shapes=sample_shapes,
+        params=params,
+        model=model,
+        train_losses=train_losses,
+        val_losses=val_losses,
+        avg_test_loss=avg_test_loss,
+        best_epoch=best_epoch,
+        best_val_loss=best_val_loss,
+    )
+    summary_json, summary_txt = write_summary_files(
+        run_layout["summaries_dir"],
+        f"{run_layout['run_name']}_training_summary",
+        train_summary,
+    )
+    print(f"Training summary saved to: {summary_json}")
+    print(f"Training summary text saved to: {summary_txt}")
 
 
 if __name__ == "__main__":

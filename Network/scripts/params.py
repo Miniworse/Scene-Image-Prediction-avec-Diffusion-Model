@@ -19,12 +19,14 @@ class AttrDict(dict):
 
 params_all = AttrDict(
     task_id=1,
+    runs_dir='./runs',
+    archive_dir='./archive',
     log_dir='./trainlog',
-    model_dir='./model/Apr22-161504.pth',
+    model_dir='./runs/latest/checkpoints/best.pth',
     # data_dir='../data/data4debug',
     data_dir='../data/data6Mai/test',
     # test_dir='../data/data15Janv/TB',
-    test_dir='../data/data6Mai/test',
+    test_dir='../data/data6Mai/test_single',
     output_dir='./output',
 
     cond_dir=['./dataset/fmcw/cond'],
@@ -37,6 +39,7 @@ params_all = AttrDict(
     epochs=200,
     learning_rate=1e-3,
     max_grad_norm=None,
+    checkpoint_every=10,
     train_ratio=0.95,
     test_ratio=0.04,
     val_ratio=0.01,

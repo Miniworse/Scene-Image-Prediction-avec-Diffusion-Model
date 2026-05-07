@@ -857,6 +857,9 @@ def save_model(model, ema, model_path, epoch=None, optimizer=None, best_val_loss
     if best_val_loss is not None:
         save_dict['best_val_loss'] = best_val_loss
 
+    model_dir = os.path.dirname(model_path)
+    if model_dir:
+        os.makedirs(model_dir, exist_ok=True)
     torch.save(save_dict, model_path)
     print(f'Model saved to {model_path}')
 

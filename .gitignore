@@ -9,6 +9,7 @@
 *.pyc
 data/
 Network/data/
-Network/output/
+Network/runs/
 Network/output_images/
-Network/model/
+Network/archive/
+

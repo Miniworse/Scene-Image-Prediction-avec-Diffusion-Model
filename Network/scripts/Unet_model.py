@@ -489,6 +489,259 @@ class UNet(nn.Module):
         return logits
 
 
+class ResBlock2d(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.norm1 = nn.GroupNorm(min(8, out_channels), out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.norm2 = nn.GroupNorm(min(8, out_channels), out_channels)
+        self.act = nn.SiLU(inplace=True)
+        if in_channels != out_channels:
+            self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        else:
+            self.shortcut = nn.Identity()
+
+    def forward(self, x):
+        identity = self.shortcut(x)
+        x = self.act(self.norm1(self.conv1(x)))
+        x = self.norm2(self.conv2(x))
+        x = self.act(x + identity)
+        return x
+
+
+class TransformerBlock2d(nn.Module):
+    def __init__(self, channels, num_heads=4, mlp_ratio=4):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(channels)
+        self.attn = nn.MultiheadAttention(channels, num_heads=num_heads, batch_first=True)
+        self.norm2 = nn.LayerNorm(channels)
+        hidden_dim = channels * mlp_ratio
+        self.mlp = nn.Sequential(
+            nn.Linear(channels, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, channels),
+        )
+
+    def forward(self, x):
+        batch_size, channels, height, width = x.shape
+        tokens = x.flatten(2).transpose(1, 2)
+        attn_input = self.norm1(tokens)
+        attn_out, _ = self.attn(attn_input, attn_input, attn_input)
+        tokens = tokens + attn_out
+        tokens = tokens + self.mlp(self.norm2(tokens))
+        return tokens.transpose(1, 2).reshape(batch_size, channels, height, width)
+
+
+class ConditionFusion(nn.Module):
+    def __init__(self, x_channels, cond_channels):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Conv2d(x_channels + cond_channels, x_channels, kernel_size=1),
+            nn.GroupNorm(min(8, x_channels), x_channels),
+            nn.SiLU(inplace=True),
+        )
+
+    def forward(self, x, cond):
+        if cond.shape[-2:] != x.shape[-2:]:
+            cond = F.interpolate(cond, size=x.shape[-2:], mode='bilinear', align_corners=False)
+        return x + self.proj(torch.cat([x, cond], dim=1))
+
+
+class IFFTConditionEncoder(nn.Module):
+    def __init__(self, in_channels=1):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=3, padding=1),
+            nn.GroupNorm(8, 32),
+            nn.SiLU(inplace=True),
+            ResBlock2d(32, 64),
+        )
+        self.down1 = nn.Sequential(
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            ResBlock2d(128, 128),
+        )
+        self.down2 = nn.Sequential(
+            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
+            ResBlock2d(256, 256),
+        )
+        self.down3 = nn.Sequential(
+            nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1),
+            ResBlock2d(512, 512),
+        )
+
+    def forward(self, x):
+        p1 = self.stem(x)
+        p2 = self.down1(p1)
+        p3 = self.down2(p2)
+        p4 = self.down3(p3)
+        return p1, p2, p3, p4
+
+
+class VisibilityConditionEncoder(nn.Module):
+    def __init__(self, in_channels=5):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=5, padding=2),
+            nn.GroupNorm(8, 32),
+            nn.SiLU(inplace=True),
+            ResBlock2d(32, 64),
+        )
+        self.stage1 = nn.Sequential(
+            ResBlock2d(64, 64),
+        )
+        self.down1 = nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1)
+        self.stage2 = nn.Sequential(
+            ResBlock2d(128, 128),
+            TransformerBlock2d(128, num_heads=4),
+        )
+        self.down2 = nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1)
+        self.stage3 = nn.Sequential(
+            ResBlock2d(256, 256),
+            TransformerBlock2d(256, num_heads=8),
+            TransformerBlock2d(256, num_heads=8),
+        )
+        self.down3 = nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1)
+        self.stage4 = nn.Sequential(
+            ResBlock2d(512, 512),
+            TransformerBlock2d(512, num_heads=8),
+        )
+
+    def forward(self, x):
+        v1 = self.stage1(self.stem(x))
+        v2 = self.stage2(self.down1(v1))
+        v3 = self.stage3(self.down2(v2))
+        v4 = self.stage4(self.down3(v3))
+        return v1, v2, v3, v4
+
+
+class ConditionalUNet(nn.Module):
+    def __init__(
+        self,
+        n_channels=1,
+        n_classes=1,
+        time_emb_dim=256,
+        ifft_channels=1,
+        visibility_channels=2,
+    ):
+        super().__init__()
+        self.n_channels = n_channels
+        self.n_classes = n_classes
+        self.time_emb_dim = time_emb_dim
+        self.ifft_channels = ifft_channels
+        self.visibility_channels = visibility_channels
+
+        self.time_embed = nn.Sequential(
+            TimestepEmbedder(time_emb_dim),
+            nn.Linear(time_emb_dim, time_emb_dim * 4),
+            nn.SiLU(),
+            nn.Linear(time_emb_dim * 4, time_emb_dim)
+        )
+
+        self.ifft_encoder = IFFTConditionEncoder(in_channels=ifft_channels)
+        self.visibility_encoder = VisibilityConditionEncoder(in_channels=visibility_channels + 3)
+
+        self.cond_proj1 = nn.Conv2d(64 + 64, 64, kernel_size=1)
+        self.cond_proj2 = nn.Conv2d(128 + 128, 128, kernel_size=1)
+        self.cond_proj3 = nn.Conv2d(256 + 256, 256, kernel_size=1)
+        self.cond_proj4 = nn.Conv2d(512 + 512, 512, kernel_size=1)
+
+        self.inc = DoubleConv(n_channels, 64, time_emb_dim)
+        self.down1 = Down(64, 128, time_emb_dim)
+        self.down2 = Down(128, 256, time_emb_dim)
+        self.down3 = Down(256, 512, time_emb_dim)
+        self.down4 = Down(512, 512, time_emb_dim, use_attention=True)
+
+        self.fuse_in = ConditionFusion(64, 64)
+        self.fuse_d1 = ConditionFusion(128, 128)
+        self.fuse_d2 = ConditionFusion(256, 256)
+        self.fuse_d3 = ConditionFusion(512, 512)
+        self.fuse_bot = ConditionFusion(512, 512)
+
+        self.bottleneck = DoubleConv(512, 512, time_emb_dim)
+        self.bottleneck_attn = SelfAttention(512)
+
+        self.up1 = Up(in_channels=512, skip_channels=512, out_channels=256,
+                      time_emb_dim=time_emb_dim, use_attention=True)
+        self.up2 = Up(in_channels=256, skip_channels=256, out_channels=128,
+                      time_emb_dim=time_emb_dim)
+        self.up3 = Up(in_channels=128, skip_channels=128, out_channels=64,
+                      time_emb_dim=time_emb_dim)
+        self.up4 = Up(in_channels=64, skip_channels=64, out_channels=64,
+                      time_emb_dim=time_emb_dim)
+
+        self.outc = nn.Sequential(
+            nn.GroupNorm(min(8, 64), 64),
+            nn.SiLU(),
+            nn.Conv2d(64, n_classes, kernel_size=1)
+        )
+
+    def _build_geometry_maps(self, antenna_xy, dtype, device):
+        if antenna_xy.dim() != 3:
+            raise ValueError("antenna_xy must have shape [B, 2, N] or [B, N, 2]")
+        if antenna_xy.shape[1] == 2:
+            x = antenna_xy[:, 0, :]
+            y = antenna_xy[:, 1, :]
+        elif antenna_xy.shape[2] == 2:
+            x = antenna_xy[:, :, 0]
+            y = antenna_xy[:, :, 1]
+        else:
+            raise ValueError("antenna_xy must have a coordinate dimension of size 2")
+
+        du = x.unsqueeze(2) - x.unsqueeze(1)
+        dv = y.unsqueeze(2) - y.unsqueeze(1)
+        r = torch.sqrt(du ** 2 + dv ** 2 + 1e-8)
+        max_norm = torch.amax(r.flatten(1), dim=1).clamp_min(1e-6).view(-1, 1, 1)
+
+        du = (du / max_norm).unsqueeze(1)
+        dv = (dv / max_norm).unsqueeze(1)
+        r = (r / max_norm).unsqueeze(1)
+        return du.to(device=device, dtype=dtype), dv.to(device=device, dtype=dtype), r.to(device=device, dtype=dtype)
+
+    def _encode_conditions(self, ifft_cond, visibility, antenna_xy, target_dtype, target_device):
+        if ifft_cond is None or visibility is None or antenna_xy is None:
+            raise ValueError("ifft_cond, visibility, and antenna_xy are required for ConditionalUNet")
+
+        if ifft_cond.dim() == 3:
+            ifft_cond = ifft_cond.unsqueeze(1)
+        if visibility.dim() == 4 and visibility.shape[-1] == self.visibility_channels:
+            visibility = visibility.permute(0, 3, 1, 2).contiguous()
+
+        du, dv, r = self._build_geometry_maps(antenna_xy, target_dtype, target_device)
+        vis_input = torch.cat([visibility.to(dtype=target_dtype, device=target_device), du, dv, r], dim=1)
+        ifft_input = ifft_cond.to(dtype=target_dtype, device=target_device)
+
+        p1, p2, p3, p4 = self.ifft_encoder(ifft_input)
+        v1, v2, v3, v4 = self.visibility_encoder(vis_input)
+
+        c1 = self.cond_proj1(torch.cat([p1, F.interpolate(v1, size=p1.shape[-2:], mode='bilinear', align_corners=False)], dim=1))
+        c2 = self.cond_proj2(torch.cat([p2, F.interpolate(v2, size=p2.shape[-2:], mode='bilinear', align_corners=False)], dim=1))
+        c3 = self.cond_proj3(torch.cat([p3, F.interpolate(v3, size=p3.shape[-2:], mode='bilinear', align_corners=False)], dim=1))
+        c4 = self.cond_proj4(torch.cat([p4, F.interpolate(v4, size=p4.shape[-2:], mode='bilinear', align_corners=False)], dim=1))
+        return c1, c2, c3, c4
+
+    def forward(self, x, timestep, ifft_cond=None, visibility=None, antenna_xy=None):
+        t = self.time_embed(timestep)
+        c1, c2, c3, c4 = self._encode_conditions(ifft_cond, visibility, antenna_xy, x.dtype, x.device)
+
+        x1 = self.fuse_in(self.inc(x, t), c1)
+        x2 = self.fuse_d1(self.down1(x1, t), c2)
+        x3 = self.fuse_d2(self.down2(x2, t), c3)
+        x4 = self.fuse_d3(self.down3(x3, t), c4)
+        x5 = self.down4(x4, t)
+
+        x5 = self.bottleneck(x5, t)
+        x5 = self.fuse_bot(x5, c4)
+        x5 = self.bottleneck_attn(x5)
+
+        x = self.up1(x5, x4, t)
+        x = self.up2(x, x3, t)
+        x = self.up3(x, x2, t)
+        x = self.up4(x, x1, t)
+
+        return self.outc(x)
+
+
 class TimestepEmbedder(nn.Module):
     def __init__(self, embedding_dim):
         super().__init__()
@@ -503,17 +756,55 @@ class TimestepEmbedder(nn.Module):
         emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
         return emb
 
-def load_model(model_path, in_channels=3, out_channels=3):
-    model = UNet(n_channels=in_channels, n_classes=out_channels, time_emb_dim=512)
+def load_model(model_path, in_channels=3, out_channels=3, architecture='UNet', **kwargs):
+    if architecture == 'ConditionalUNet':
+        model = ConditionalUNet(
+            n_channels=in_channels,
+            n_classes=out_channels,
+            time_emb_dim=kwargs.pop('time_emb_dim', 512),
+            ifft_channels=kwargs.pop('ifft_channels', 1),
+            visibility_channels=kwargs.pop('visibility_channels', 2),
+        )
+    else:
+        model = UNet(n_channels=in_channels, n_classes=out_channels, time_emb_dim=kwargs.pop('time_emb_dim', 512))
 
     if not os.path.exists(model_path):
         print(f"Model file {model_path} not found!")
         return None, None
 
     checkpoint = torch.load(model_path, map_location='cpu')
+    model_config = checkpoint.get('model_config', {})
+    if model_config:
+        architecture = model_config.get('architecture', architecture)
+        if architecture == 'ConditionalUNet' and not isinstance(model, ConditionalUNet):
+            model = ConditionalUNet(
+                n_channels=model_config.get('n_channels', in_channels),
+                n_classes=model_config.get('n_classes', out_channels),
+                time_emb_dim=model_config.get('time_emb_dim', 512),
+                ifft_channels=model_config.get('ifft_channels', 1),
+                visibility_channels=model_config.get('visibility_channels', 2),
+            )
+        elif architecture == 'UNet' and not isinstance(model, UNet):
+            model = UNet(
+                n_channels=model_config.get('n_channels', in_channels),
+                n_classes=model_config.get('n_classes', out_channels),
+                time_emb_dim=model_config.get('time_emb_dim', 512),
+            )
+    elif architecture != model.__class__.__name__:
+        raise ValueError(
+            f"Checkpoint {model_path} has no model_config, but requested architecture "
+            f"is {architecture} while the instantiated model is {model.__class__.__name__}. "
+            "This usually means you are trying to load an old checkpoint into a new architecture."
+        )
 
     if 'model_state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['model_state_dict'])
+        try:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"Failed to load checkpoint {model_path} into {model.__class__.__name__}. "
+                "The checkpoint architecture is incompatible with the current model definition."
+            ) from exc
         print(f"Loaded model weights from {model_path}")
 
         ema = EMA(model, decay=0.999)
@@ -547,7 +838,15 @@ def save_model(model, ema, model_path, epoch=None, optimizer=None, best_val_loss
     """
     save_dict = {
         'model_state_dict': model.state_dict(),
-        'ema_state_dict': ema.shadow if hasattr(ema, 'shadow') else ema.state_dict()
+        'ema_state_dict': ema.shadow if hasattr(ema, 'shadow') else ema.state_dict(),
+        'model_config': {
+            'architecture': model.__class__.__name__,
+            'n_channels': getattr(model, 'n_channels', None),
+            'n_classes': getattr(model, 'n_classes', None),
+            'time_emb_dim': getattr(model, 'time_emb_dim', None),
+            'ifft_channels': getattr(model, 'ifft_channels', None),
+            'visibility_channels': getattr(model, 'visibility_channels', None),
+        }
     }
 
     # 可选信息（用于恢复训练）

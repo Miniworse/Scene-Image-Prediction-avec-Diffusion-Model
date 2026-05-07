@@ -2,7 +2,6 @@ import torch
 import numpy as np
 import os
 # import tqdm
-from sympy.polys.matrices.dense import ddm_iinv
 from tqdm import tqdm
 
 
@@ -67,22 +66,37 @@ class NoiseScheduler:
         xt = self.add_noise(x0, t, noise)
         return xt, noise
 
-    def fast_sampling(self, model, x_0, y):
+    def _predict(self, model, x_t, t, condition):
+        if isinstance(condition, dict):
+            return model(
+                x_t,
+                t,
+                ifft_cond=condition.get('ifft_cond'),
+                visibility=condition.get('visibility'),
+                antenna_xy=condition.get('antenna_xy'),
+            )
+        if condition is None:
+            return model(x_t, t)
+        x_t_y = torch.cat((x_t, condition), dim=1)
+        return model(x_t_y, t)
+
+    def fast_sampling(self, model, x_0, condition):
         t = torch.tensor([self.T - 1]).to(self.device)
         x_t = torch.randn_like(x_0).to(self.device)
-        y_noise = torch.randn_like(y).to(self.device)
-        y_t = self.add_noise(y, t, y_noise)
-        x_t_y = torch.cat((x_t, y_t), dim=1)
-        pre_noise = model(x_t_y, t)
+        if isinstance(condition, dict):
+            pre_noise = self._predict(model, x_t, t, condition)
+        else:
+            y_noise = torch.randn_like(condition).to(self.device)
+            y_t = self.add_noise(condition, t, y_noise)
+            pre_noise = self._predict(model, x_t, t, y_t)
 
         predicted = self.deblur(x_t, t, pre_noise)
         return pre_noise, predicted
 
-    def sampling(self, model, x_t, y):
+    def sampling(self, model, x_t, condition):
         for i in range(self.T - 1, -1, -1):
             t = torch.tensor([i]).to(self.device)
-            x_t_y = torch.cat((x_t, y), dim=1)
-            pre_noise = model(x_t_y, t)
+            pre_noise = self._predict(model, x_t, t, condition)
             x_0 = self.deblur(x_t, t, pre_noise)
             if i>0:
                 x_t = self.add_noise(x_0, t = torch.tensor([i-1]), noise=pre_noise)
@@ -90,23 +104,21 @@ class NoiseScheduler:
 
         return pre_noise, predicted
 
-    def native_sampling(self, model, x_0, y):
+    def native_sampling(self, model, x_0, condition):
         t = torch.tensor([500]).to(self.device)
         x_t = self.add_noise(x_0, t, noise=torch.randn_like(x_0))
-        x_t_y = torch.cat((x_t, y), dim=1)
-        pre_noise = model(x_t_y, t)
+        pre_noise = self._predict(model, x_t, t, condition)
         predicted = self.deblur(x_t, t, pre_noise)
 
         return pre_noise, predicted
 
-    def native_sampling2(self, model, x_0, y, flag = False):
+    def native_sampling2(self, model, x_0, condition, flag = False):
         x_t = self.add_noise(x_0, torch.tensor([self.T - 1]), noise=torch.randn_like(x_0))
         # x_t=torch.randn_like(x_0)
         
         for i in range(self.T - 1, -1, -1):
             t = torch.tensor([i]).to(self.device)
-            x_t_y = torch.cat((x_t, y), dim=1)
-            pre_noise = model(x_t_y, t)
+            pre_noise = self._predict(model, x_t, t, condition)
             x_0 = self.deblur(x_t, t, pre_noise)
             # x_0 = torch.clamp(x_0, -2.0, 2.0) # Use your [-2, 2] range
             if i>0:
@@ -182,7 +194,7 @@ class NoiseScheduler:
 #         return pred_noise, x_t #torch.clamp(x_t, -1, 1)
 
     @torch.no_grad()
-    def ddim_sampling(self, model, x_0, y, steps=1000, eta=0.0):
+    def ddim_sampling(self, model, x_0, condition, steps=1000, eta=0.0):
         model.eval()
         x_t = torch.randn_like(x_0).to(self.device)
 
@@ -190,8 +202,7 @@ class NoiseScheduler:
             t = torch.full((x_t.shape[0],), i, device=self.device, dtype=torch.long)
 
             # 1. Predict Noise
-            x_t_y = torch.cat((x_t, y), dim=1)
-            pred_v = model(x_t_y, t)
+            pred_v = self._predict(model, x_t, t, condition)
 
             # 2. Get Alphas and reshape for 4D broadcasting
             at = self.alphas_cumprod[i].view(-1, 1, 1, 1)
@@ -242,25 +253,39 @@ class NoiseScheduler:
     # # 方案B: 增加采样步数（质量更好，但更慢）
     # samples = ddim_sample(model, scheduler, noise, steps=200, eta=0.5)
     @torch.no_grad()
-    def sample_cfg(self, model, y, steps=1000, cfg_scale=3.0):
+    def sample_cfg(self, model, condition, steps=1000, cfg_scale=3.0):
         """
         cfg_scale: 1.0 is standard. 2.0-7.0 'pushes' the image to be cleaner.
         """
         model.eval()
-        batch_size = y.shape[0]
-        x_t = torch.randn((batch_size, 1, y.shape[2], y.shape[3]), device=self.device)
+        if isinstance(condition, dict):
+            batch_size = condition['ifft_cond'].shape[0]
+            height = condition['ifft_cond'].shape[2]
+            width = condition['ifft_cond'].shape[3]
+        else:
+            batch_size = condition.shape[0]
+            height = condition.shape[2]
+            width = condition.shape[3]
+        x_t = torch.randn((batch_size, 1, height, width), device=self.device)
 
         # Create a null condition (zeros) for the unconditional branch
-        y_null = torch.zeros_like(y)
+        if isinstance(condition, dict):
+            null_condition = {
+                'ifft_cond': torch.zeros_like(condition['ifft_cond']),
+                'visibility': torch.zeros_like(condition['visibility']),
+                'antenna_xy': condition['antenna_xy'],
+            }
+        else:
+            null_condition = torch.zeros_like(condition)
 
         for i in tqdm(reversed(range(0, steps)), desc='CFG Sampling'):
             t = torch.full((batch_size,), i, device=self.device, dtype=torch.long)
 
             # 1. Predict noise WITH condition
-            eps_cond = model(torch.cat([x_t, y], dim=1), t)
+            eps_cond = self._predict(model, x_t, t, condition)
 
             # 2. Predict noise WITHOUT condition
-            eps_uncond = model(torch.cat([x_t, y_null], dim=1), t)
+            eps_uncond = self._predict(model, x_t, t, null_condition)
 
             # 3. Combine: The 'Guidance' formula
             # This pushes the model away from 'generic' noise toward the specific signal

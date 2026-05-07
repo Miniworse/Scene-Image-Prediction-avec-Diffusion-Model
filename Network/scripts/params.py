@@ -21,17 +21,17 @@ params_all = AttrDict(
     task_id=1,
     log_dir='./trainlog',
     model_dir='./model/Apr22-161504.pth',
-    data_dir='../data/data4debug',
-    # data_dir='../data/data20Avr/test',
+    # data_dir='../data/data4debug',
+    data_dir='../data/data6Mai/test',
     # test_dir='../data/data15Janv/TB',
-    test_dir='../data/data20Avr/test',
+    test_dir='../data/data6Mai/test',
     output_dir='./output',
 
     cond_dir=['./dataset/fmcw/cond'],
     fid_pred_dir = './dataset/fmcw/img_matric/pred',
     fid_data_dir = './dataset/fmcw/img_matric/data',
     # Training params
-    load_pretrained = True,
+    load_pretrained = False,
     max_iter=None, # Unlimited number of iterations.
     batch_size=1,
     epochs=200,

@@ -218,5 +218,5 @@ def visualize_and_save_outputs(target_path, save_dir=None, cmap="jet", recursive
 
 
 if __name__ == "__main__":
-    target_path = "May07-204141"
+    target_path = "May10-051249"
     visualize_and_save_outputs(target_path, recursive=True)

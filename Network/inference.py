@@ -130,7 +130,13 @@ def predict_and_save(model, ema, dataset, output_dir, device="cuda"):
                 "visibility": visibility,
                 "antenna_xy": array_info,
             }
-            pre_noise, predicted = noise_scheduler.ddim_sampling(model, scene, condition, steps=1000, eta=0)
+            pre_noise, predicted = noise_scheduler.ddim_sampling(
+                model,
+                scene,
+                condition,
+                steps=params_all.test_sampling_steps,
+                eta=0,
+            )
 
             if ema is not None:
                 ema.restore()
@@ -326,7 +332,7 @@ def build_inference_summary(
         "inference_setup": {
             "architecture": "ConditionalUNet",
             "sampler": "ddim",
-            "sampling_steps": 250,
+            "sampling_steps": params.test_sampling_steps,
             "eta": 0,
             "normalize_inputs": True,
         },

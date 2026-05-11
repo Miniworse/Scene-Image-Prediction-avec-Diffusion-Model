@@ -198,15 +198,26 @@ class NoiseScheduler:
         model.eval()
         x_t = torch.randn_like(x_0).to(self.device)
 
-        for i in tqdm(reversed(range(0, steps)), desc='DDIM'):
-            t = torch.full((x_t.shape[0],), i, device=self.device, dtype=torch.long)
+        if steps <= 0:
+            raise ValueError("steps must be a positive integer")
+
+        steps = min(int(steps), self.T)
+        timestep_schedule = torch.linspace(0, self.T - 1, steps, device=self.device).round().long()
+
+        for schedule_idx in tqdm(reversed(range(timestep_schedule.shape[0])), desc='DDIM'):
+            t_index = int(timestep_schedule[schedule_idx].item())
+            t = torch.full((x_t.shape[0],), t_index, device=self.device, dtype=torch.long)
 
             # 1. Predict Noise
             pred_v = self._predict(model, x_t, t, condition)
 
             # 2. Get Alphas and reshape for 4D broadcasting
-            at = self.alphas_cumprod[i].view(-1, 1, 1, 1)
-            at_prev = (self.alphas_cumprod[i - 1] if i > 0 else torch.tensor(1.0)).view(-1, 1, 1, 1).to(self.device)
+            at = self.alphas_cumprod[t_index].view(-1, 1, 1, 1)
+            if schedule_idx > 0:
+                prev_t_index = int(timestep_schedule[schedule_idx - 1].item())
+                at_prev = self.alphas_cumprod[prev_t_index].view(-1, 1, 1, 1)
+            else:
+                at_prev = torch.tensor(1.0, device=self.device).view(-1, 1, 1, 1)
 
             # 3. Estimate x0 (The "predicted x0")
             # Formula: (x_t - sqrt(1 - alpha_t) * epsilon) / sqrt(alpha_t)
@@ -220,7 +231,7 @@ class NoiseScheduler:
             # OPTIONAL: pred_x0 = torch.clamp(pred_x0, -2, 2)
             # Since you said clamping made it worse, keep it commented but watch it.
 
-            if i > 0:
+            if schedule_idx > 0:
                 # 4. Calculate Sigma (randomness)
                 # sigma = eta * sqrt((1 - at_prev)/(1 - at) * (1 - at/at_prev))
                 sigma = eta * torch.sqrt((1 - at_prev) / (1 - at) * (1 - at / at_prev))
@@ -236,7 +247,7 @@ class NoiseScheduler:
                 x_t = pred_x0
 
             flag = True
-            if i % 10 == 0 & flag:
+            if t_index % 10 == 0 and flag:
                 # 写一个小接口，
                 output_dir = f'./output/t_sample_ddim_V5'
                 os.makedirs(output_dir, exist_ok=True)

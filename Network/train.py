@@ -4,6 +4,7 @@ import os
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset
@@ -138,7 +139,14 @@ def build_noise_scheduler(device):
     return diffusion.NoiseScheduler(betas, device=device)
 
 
-def compute_diffusion_loss(model, noise_scheduler, batch, device):
+def predict_x0_from_velocity(noise_scheduler, xt, pred_v, t):
+    at = noise_scheduler.alphas_cumprod[t].view(-1, 1, 1, 1)
+    sqrt_at = torch.sqrt(at)
+    sqrt_one_minus_at = torch.sqrt(1 - at)
+    return sqrt_at * xt - sqrt_one_minus_at * pred_v
+
+
+def compute_diffusion_loss(model, noise_scheduler, batch, device, params):
     batch = move_batch_to_device(batch, device)
     scene_imgs = batch["scene"]
     ifft_imgs = batch["ifft"]
@@ -160,7 +168,15 @@ def compute_diffusion_loss(model, noise_scheduler, batch, device):
     velocity = noise_scheduler.get_velocity(scene_imgs, noise, t)
     snr = noise_scheduler.get_snr(t).view(-1, 1, 1, 1)
     weight = snr / (snr + 1)
-    loss = (weight * (outputs - velocity) ** 2).mean()
+    diffusion_loss = (weight * (outputs - velocity) ** 2).mean()
+
+    pred_x0 = predict_x0_from_velocity(noise_scheduler, xt, outputs, t)
+    if params.recon_loss_type == "mse":
+        recon_loss = F.mse_loss(pred_x0, scene_imgs)
+    else:
+        recon_loss = F.l1_loss(pred_x0, scene_imgs)
+
+    loss = diffusion_loss + params.recon_loss_weight * recon_loss
 
     context = {
         "scene": scene_imgs,
@@ -169,13 +185,17 @@ def compute_diffusion_loss(model, noise_scheduler, batch, device):
         "array": array_info,
         "xt": xt,
         "outputs": outputs,
+        "pred_x0": pred_x0,
         "timestep": t,
         "sample_id": batch["id"][0],
+        "diffusion_loss": diffusion_loss.detach(),
+        "recon_loss": recon_loss.detach(),
+        "total_loss": loss.detach(),
     }
     return loss, context
 
 
-def evaluate_validation(model, val_loader, noise_scheduler, device):
+def evaluate_validation(model, val_loader, noise_scheduler, device, params):
     if val_loader is None or len(val_loader) == 0:
         return None
 
@@ -183,10 +203,81 @@ def evaluate_validation(model, val_loader, noise_scheduler, device):
     losses = []
     with torch.no_grad():
         for batch in val_loader:
-            loss, _ = compute_diffusion_loss(model, noise_scheduler, batch, device)
+            loss, _ = compute_diffusion_loss(model, noise_scheduler, batch, device, params)
             losses.append(loss.item())
     model.train()
     return float(np.mean(losses)) if losses else None
+
+
+def calculate_ssim_batch(predictions, targets):
+    from skimage.metrics import structural_similarity as ssim
+
+    values = []
+    pred_np = predictions.detach().cpu().numpy()
+    target_np = targets.detach().cpu().numpy()
+    for pred, target in zip(pred_np, target_np):
+        pred_img = pred.squeeze(0) if pred.ndim == 3 else pred
+        target_img = target.squeeze(0) if target.ndim == 3 else target
+        values.append(ssim(pred_img, target_img, data_range=1.0, win_size=11, gaussian_weights=True))
+    return values
+
+
+def evaluate_validation_reconstruction(model, ema, val_loader, device, params):
+    if val_loader is None or len(val_loader) == 0:
+        return None
+
+    model.eval()
+    noise_scheduler = build_noise_scheduler(device)
+    all_ssim = []
+    mse_values = []
+    processed = 0
+
+    with torch.no_grad():
+        if ema is not None:
+            ema.apply_shadow()
+
+        for batch in val_loader:
+            batch = move_batch_to_device(batch, device)
+            scene_imgs = batch["scene"]
+            ifft_imgs = batch["ifft"]
+            visibility_imgs = batch["visibility"]
+            array_info = batch["array"]
+
+            condition = {
+                "ifft_cond": ifft_imgs,
+                "visibility": visibility_imgs,
+                "antenna_xy": array_info,
+            }
+            _, predicted = noise_scheduler.ddim_sampling(
+                model,
+                scene_imgs,
+                condition,
+                steps=params.validation_sampling_steps,
+                eta=0,
+            )
+
+            mse_values.append(torch.mean((predicted - scene_imgs) ** 2).item())
+            all_ssim.extend(calculate_ssim_batch(predicted, scene_imgs))
+            processed += scene_imgs.shape[0]
+            if params.validation_eval_limit and processed >= params.validation_eval_limit:
+                break
+
+        if ema is not None:
+            ema.restore()
+
+    model.train()
+
+    if not all_ssim:
+        return None
+
+    return {
+        "ssim_mean": float(np.mean(all_ssim)),
+        "ssim_std": float(np.std(all_ssim)),
+        "poor_count": int(sum(v < params.ssim_poor_threshold for v in all_ssim)),
+        "good_count": int(sum(v >= params.ssim_good_threshold for v in all_ssim)),
+        "mse_mean": float(np.mean(mse_values)) if mse_values else None,
+        "num_samples": len(all_ssim),
+    }
 
 
 def save_training_snapshot(context, noise_scheduler, target_dir, epoch):
@@ -238,9 +329,12 @@ def build_train_summary(
     model,
     train_losses,
     val_losses,
+    val_ssim_history,
     avg_test_loss,
     best_epoch,
     best_val_loss,
+    best_ssim_epoch,
+    best_val_ssim,
 ):
     return {
         "title": f"Training Summary - {run_layout['run_name']}",
@@ -270,7 +364,7 @@ def build_train_summary(
         },
         "sampling_for_test_visualization": {
             "sampler": "ddim",
-            "steps": 250,
+            "steps": params.test_sampling_steps,
             "eta": 0,
             "criterion": "MSE(predicted_scene, target_scene)",
         },
@@ -283,8 +377,11 @@ def build_train_summary(
             "val_loss_last": float(val_losses[-1]) if val_losses and val_losses[-1] is not None else None,
             "val_loss_min": float(min(loss for loss in val_losses if loss is not None)) if any(loss is not None for loss in val_losses) else None,
             "val_loss_curve": [float(loss) if loss is not None else None for loss in val_losses],
+            "val_ssim_history": val_ssim_history,
             "best_epoch": best_epoch,
             "best_val_loss": float(best_val_loss) if best_val_loss is not None else None,
+            "best_ssim_epoch": best_ssim_epoch,
+            "best_val_ssim": float(best_val_ssim) if best_val_ssim is not None else None,
             "test_loss": float(avg_test_loss) if avg_test_loss is not None else None,
         },
     }
@@ -308,8 +405,11 @@ def train_model(
     start_epoch = 0
     train_losses = []
     val_losses = []
+    val_ssim_history = []
     best_val_loss = None
     best_epoch = None
+    best_val_ssim = None
+    best_ssim_epoch = None
 
     if params.load_pretrained and resume_checkpoint_path:
         model, ema, start_epoch, best_val_loss = load_pretrained_model(
@@ -329,6 +429,7 @@ def train_model(
     noise_scheduler = build_noise_scheduler(device)
     latest_checkpoint_path = run_layout["latest_checkpoint"]
     best_checkpoint_path = run_layout["best_checkpoint"]
+    best_ssim_checkpoint_path = os.path.join(run_layout["checkpoints_dir"], "best_by_ssim.pth")
 
     for epoch in range(start_epoch, params.epochs):
         model.train()
@@ -336,7 +437,7 @@ def train_model(
         last_context = None
 
         for batch_idx, batch in enumerate(train_loader):
-            loss, context = compute_diffusion_loss(model, noise_scheduler, batch, device)
+            loss, context = compute_diffusion_loss(model, noise_scheduler, batch, device, params)
             optimizer.zero_grad()
             loss.backward()
             if params.max_grad_norm is not None:
@@ -349,19 +450,31 @@ def train_model(
             if batch_idx % 10 == 0:
                 print(
                     f"Epoch: {epoch + 1}/{params.epochs} | "
-                    f"Batch: {batch_idx}/{len(train_loader)} | Loss: {loss.item():.6f}"
+                    f"Batch: {batch_idx}/{len(train_loader)} | "
+                    f"Total: {loss.item():.6f} | "
+                    f"Diff: {context['diffusion_loss'].item():.6f} | "
+                    f"Recon: {context['recon_loss'].item():.6f}"
                 )
 
         avg_train_loss = epoch_loss / max(len(train_loader), 1)
-        val_loss = evaluate_validation(model, val_loader, noise_scheduler, device)
+        val_loss = evaluate_validation(model, val_loader, noise_scheduler, device, params)
+        val_ssim_metrics = None
+        if params.validation_ssim_every and ((epoch + 1) % params.validation_ssim_every == 0):
+            val_ssim_metrics = evaluate_validation_reconstruction(model, ema, val_loader, device, params)
         scheduler_metric = val_loss if val_loss is not None else avg_train_loss
         scheduler.step(scheduler_metric)
 
         train_losses.append(avg_train_loss)
         val_losses.append(val_loss)
+        val_ssim_history.append(val_ssim_metrics)
         writer.add_scalar("Loss/train", avg_train_loss, epoch)
         if val_loss is not None:
             writer.add_scalar("Loss/validation", val_loss, epoch)
+        if val_ssim_metrics is not None:
+            writer.add_scalar("SSIM/validation_mean", val_ssim_metrics["ssim_mean"], epoch)
+            writer.add_scalar("SSIM/validation_std", val_ssim_metrics["ssim_std"], epoch)
+            writer.add_scalar("SSIM/validation_poor_count", val_ssim_metrics["poor_count"], epoch)
+            writer.add_scalar("SSIM/validation_good_count", val_ssim_metrics["good_count"], epoch)
         writer.add_scalar("Learning_rate", optimizer.param_groups[0]["lr"], epoch)
 
         save_model(
@@ -386,6 +499,24 @@ def train_model(
             )
             print(f"Best checkpoint updated at epoch {epoch + 1} with val loss {best_val_loss:.6f}")
 
+        if val_ssim_metrics is not None and (
+            best_val_ssim is None or val_ssim_metrics["ssim_mean"] > best_val_ssim
+        ):
+            best_val_ssim = val_ssim_metrics["ssim_mean"]
+            best_ssim_epoch = epoch + 1
+            save_model(
+                model,
+                ema,
+                best_ssim_checkpoint_path,
+                epoch=epoch,
+                optimizer=optimizer,
+                best_val_loss=best_val_loss,
+            )
+            print(
+                f"Best SSIM checkpoint updated at epoch {epoch + 1} "
+                f"with val SSIM {best_val_ssim:.6f}"
+            )
+
         if params.checkpoint_every and (epoch + 1) % params.checkpoint_every == 0:
             epoch_checkpoint_path = os.path.join(
                 run_layout["checkpoints_dir"],
@@ -403,10 +534,17 @@ def train_model(
                 save_training_snapshot(last_context, noise_scheduler, run_layout["train_dir"], epoch + 1)
 
         val_loss_display = f"{val_loss:.6f}" if val_loss is not None else "N/A"
+        ssim_display = (
+            f"{val_ssim_metrics['ssim_mean']:.4f} "
+            f"(poor<{params.ssim_poor_threshold}: {val_ssim_metrics['poor_count']}, "
+            f"good>={params.ssim_good_threshold}: {val_ssim_metrics['good_count']})"
+            if val_ssim_metrics is not None
+            else "N/A"
+        )
         print(
             f"Epoch: {epoch + 1}/{params.epochs} | "
             f"Train Loss: {avg_train_loss:.6f} | Val Loss: {val_loss_display} | "
-            f"LR: {optimizer.param_groups[0]['lr']:.6f}"
+            f"Val SSIM: {ssim_display} | LR: {optimizer.param_groups[0]['lr']:.6f}"
         )
         print("-" * 60)
 
@@ -416,11 +554,24 @@ def train_model(
     checkpoint_paths = {
         "latest": latest_checkpoint_path,
         "best": best_checkpoint_path if os.path.exists(best_checkpoint_path) else None,
+        "best_by_ssim": best_ssim_checkpoint_path if os.path.exists(best_ssim_checkpoint_path) else None,
     }
-    return model, ema, optimizer, train_losses, val_losses, best_epoch, best_val_loss, checkpoint_paths
+    return (
+        model,
+        ema,
+        optimizer,
+        train_losses,
+        val_losses,
+        val_ssim_history,
+        best_epoch,
+        best_val_loss,
+        best_ssim_epoch,
+        best_val_ssim,
+        checkpoint_paths,
+    )
 
 
-def test_and_visualize(model, ema, test_loader, output_dir, device="cuda"):
+def test_and_visualize(model, ema, test_loader, output_dir, params, device="cuda"):
     model.eval()
     criterion = torch.nn.MSELoss()
     test_loss = 0.0
@@ -443,7 +594,13 @@ def test_and_visualize(model, ema, test_loader, output_dir, device="cuda"):
                 "visibility": visibility_imgs,
                 "antenna_xy": array_info,
             }
-            pre_noise, predicted = noise_scheduler.ddim_sampling(model, scene_imgs, condition, steps=1000, eta=0)
+            pre_noise, predicted = noise_scheduler.ddim_sampling(
+                model,
+                scene_imgs,
+                condition,
+                steps=params.test_sampling_steps,
+                eta=0,
+            )
 
             if ema is not None:
                 ema.restore()
@@ -551,7 +708,19 @@ def main(args):
     print(f"Latest checkpoint path: {run_layout['latest_checkpoint']}")
     print(f"Best checkpoint path: {run_layout['best_checkpoint']}")
 
-    model, ema, optimizer, train_losses, val_losses, best_epoch, best_val_loss, checkpoint_paths = train_model(
+    (
+        model,
+        ema,
+        optimizer,
+        train_losses,
+        val_losses,
+        val_ssim_history,
+        best_epoch,
+        best_val_loss,
+        best_ssim_epoch,
+        best_val_ssim,
+        checkpoint_paths,
+    ) = train_model(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
@@ -562,7 +731,7 @@ def main(args):
     )
 
     print("\nTesting model...")
-    avg_test_loss = test_and_visualize(model, ema, test_loader, run_layout["test_dir"], device)
+    avg_test_loss = test_and_visualize(model, ema, test_loader, run_layout["test_dir"], params, device)
 
     if not os.path.exists(checkpoint_paths["best"] or ""):
         save_model(
@@ -586,9 +755,12 @@ def main(args):
         model=model,
         train_losses=train_losses,
         val_losses=val_losses,
+        val_ssim_history=val_ssim_history,
         avg_test_loss=avg_test_loss,
         best_epoch=best_epoch,
         best_val_loss=best_val_loss,
+        best_ssim_epoch=best_ssim_epoch,
+        best_val_ssim=best_val_ssim,
     )
     summary_json, summary_txt = write_summary_files(
         run_layout["summaries_dir"],
